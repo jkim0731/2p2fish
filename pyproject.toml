@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "mfish-autocoreg"
+version = "0.1.0"
+description = "Automated coregistration pipeline for mFISH / Ca-imaging data"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pandas",
+    "scipy",
+    "scikit-image",
+    "tifffile",
+    "zarr",
+    "pyarrow",
+    "scikit-learn",
+]
+
+[project.optional-dependencies]
+qc = [
+    "PyQt5",
+    "pyqtgraph",
+    "opencv-python",
+]
+
+[project.scripts]
+autocoreg = "autocoreg.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"
