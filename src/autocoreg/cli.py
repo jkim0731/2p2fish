@@ -19,7 +19,8 @@ import argparse
 import sys
 
 
-def _run(sid: str, out_dir: str | None, launch_qc: bool) -> None:
+def _run(sid: str, out_dir: str | None, launch_qc: bool,
+         qc_variant: str = "local_flow") -> None:
     from .benchmark_data_loader import load_subject
     from .surfaces_iter08 import get_cz_surface_iter08, get_hcr_top_surface_iter07
     from .roi_area_sxy import estimate_sxy_min_rule
@@ -51,12 +52,13 @@ def _run(sid: str, out_dir: str | None, launch_qc: bool) -> None:
 
     if launch_qc:
         try:
-            from PyQt5 import QtWidgets
+            from PyQt5 import QtWidgets  # noqa: F401
         except ImportError:
             print("[autocoreg] ERROR: --qc requires PyQt5; install with: pip install mfish-autocoreg[qc]")
             sys.exit(1)
-        from .qc.app import main as qc_main
-        qc_main(sid)
+        from .qc.app import launch as qc_launch
+        app, _win = qc_launch(sid, variant=qc_variant)
+        sys.exit(app.exec_())
 
 
 def main() -> None:
@@ -69,12 +71,14 @@ def main() -> None:
     run_parser = subparsers.add_parser("run", help="Run the full pipeline on a subject")
     run_parser.add_argument("subject_id", help="Subject ID (e.g. 790322)")
     run_parser.add_argument("--qc", action="store_true", help="Launch QC viewer after matching")
+    run_parser.add_argument("--qc-variant", default="local_flow",
+                            help="Matcher variant whose QC artifacts to view (default local_flow)")
     run_parser.add_argument("--out-dir", default=None, help="Output directory for results")
 
     args = parser.parse_args()
 
     if args.command == "run":
-        _run(args.subject_id, args.out_dir, args.qc)
+        _run(args.subject_id, args.out_dir, args.qc, qc_variant=args.qc_variant)
     else:
         parser.print_help()
         sys.exit(1)

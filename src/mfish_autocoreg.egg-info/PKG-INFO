@@ -1,0 +1,19 @@
+Metadata-Version: 2.4
+Name: mfish-autocoreg
+Version: 0.1.0
+Summary: Automated coregistration pipeline for mFISH / Ca-imaging data
+Requires-Python: >=3.10
+License-File: LICENSE
+Requires-Dist: numpy
+Requires-Dist: pandas
+Requires-Dist: scipy
+Requires-Dist: scikit-image
+Requires-Dist: tifffile
+Requires-Dist: zarr
+Requires-Dist: pyarrow
+Requires-Dist: scikit-learn
+Provides-Extra: qc
+Requires-Dist: PyQt5; extra == "qc"
+Requires-Dist: pyqtgraph; extra == "qc"
+Requires-Dist: opencv-python; extra == "qc"
+Dynamic: license-file
