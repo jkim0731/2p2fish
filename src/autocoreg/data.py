@@ -131,8 +131,9 @@ def subject_inputs(sid: str, sz_pins: dict[str, float] | None = None) -> Subject
         sz_pin = float(sz_pins[sid])
     else:
         # GT-free path: use sz_estimator to compute sz from image data.
+        # get_sz returns a dict; sz_best is the peak (== validation table sz_peak).
         from .sz_estimator import get_sz
-        sz_pin = float(get_sz(s))
+        sz_pin = float(get_sz(s)["sz_best"])
     lp = compute_locked_prior_warm_start(s, sz_init=sz_pin)
     cz_lp = apply_to_cz_um(lp, cz_um)
     crop = get_overlap_crop(s, margin_frac=0.10)
