@@ -78,7 +78,7 @@ Public API
 * :func:`hcr_cell_tight_bboxes` — per-HCR-cell bbox + depth, level-0
   correctly applied, for a caller-supplied hcr_id set.
 * :func:`estimate_sxy_roi_area` — full driver for one subject.
-* :func:`_argmax_ok_ids` — HCR ids whose v5d 4-class argmax ∈ {p_good, p_bad_ok}.
+* :func:`_argmax_ok_ids` — HCR ids whose 4-class argmax ∈ {p_good, p_bad_ok}.
 * :func:`estimate_sxy_roi_area_slab` — slab∩ok estimator for thin-HCR subjects.
 * :func:`estimate_sxy_auto` — auto-detects thin vs thick and returns sxy_median.
 
@@ -739,16 +739,16 @@ def estimate_sxy_roi_area(
 # Slab∩ok estimator — thin-HCR branch
 # -----------------------------------------------------------
 def _argmax_ok_ids(sid: str) -> set[int] | None:
-    """Return HCR ids whose v5d 4-class argmax ∈ {p_good, p_bad_ok}.
+    """Return HCR ids whose 4-class argmax ∈ {p_good, p_bad_ok}.
 
-    Reads ``cached_roi_quality/{sid}_stage2_4class_proba_v5d_um.parquet``
+    Reads ``cached_roi_quality/{sid}_roi_quality_proba.parquet``
     (relative to this module's directory).  Returns None when the file is
     missing so callers can fall back gracefully.
 
     Coordinate frame: hcr_id labels in the HCR segmentation (dimensionless
     integer cell identifiers, same frame as hcr_centroids and metrics.pickle).
     """
-    p = ROI_QUALITY_DIR / f"{sid}_stage2_4class_proba_v5d_um.parquet"
+    p = ROI_QUALITY_DIR / f"{sid}_roi_quality_proba.parquet"
     if not p.exists():
         return None
     df = pd.read_parquet(p)

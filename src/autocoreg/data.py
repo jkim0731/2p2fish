@@ -87,7 +87,7 @@ def strict_gfp_ids(sid: str) -> tuple[set[int], dict]:
 # ROI quality argmax-ok (per user feedback)
 # --------------------------------------------------------------------------- #
 def argmax_ok_ids(sid: str) -> set[int]:
-    p = _config.ROI_QUALITY_DIR / f"{sid}_stage2_4class_proba_v5d_um.parquet"
+    p = _config.ROI_QUALITY_DIR / f"{sid}_roi_quality_proba.parquet"
     df = pd.read_parquet(p)
     cls = ["p_bad", "p_bad_ok", "p_good", "p_merged"]
     am = df[cls].idxmax(axis=1)
