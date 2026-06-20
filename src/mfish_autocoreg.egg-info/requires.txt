@@ -1,0 +1,13 @@
+numpy
+pandas
+scipy
+scikit-image
+tifffile
+zarr
+pyarrow
+scikit-learn
+
+[qc]
+PyQt5
+pyqtgraph
+opencv-python

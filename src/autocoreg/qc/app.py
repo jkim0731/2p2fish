@@ -13,6 +13,16 @@ Per-ROI label is logged to outputs/qc_labels/qt_<variant>_<sid>.csv:
 
 Auto-save on every radio click.
 
+Add-match mode (function 2 — manual registration improvement):
+  Toggle with 'a'.  Mimics the BigWarp landmark workflow: the active landmark
+  set is seeded from the matcher's accepted pairs and a per-axis thin-plate-
+  spline (CZ-native µm -> HCR µm) is fit from it.  Click a CZ ROI (snaps to the
+  nearest warped CZ centroid, gold markers) then its HCR cell (label under the
+  cursor, else nearest HCR centroid); "Add pair" appends the landmark, refits
+  the TPS, and re-warps the CZ centroid markers so alignment visibly improves.
+  Each add/undo is auto-saved (append-only) to
+  qc_labels/manual_matches_<variant>_<sid>.csv and replayed on relaunch.
+
 Keys:
   → / ←  next / prev CZ ROI
   ↑ / ↓  Z slice ±1 (slice mode only)
@@ -22,15 +32,21 @@ Keys:
   w          toggle CZ warped image
   c          toggle "other CZ ROIs"
   h          toggle "other HCR ROIs"
+  a          toggle add-match mode
+  Enter      add the pending CZ↔HCR pair (add-match mode)
+  Backspace  undo last added pair (add-match mode)
+  Esc        reset the pending selection (add-match mode)
 
 Usage:
-  python qc_qt_app.py --sid 790322 --variant local_flow
+  autocoreg run <sid> --qc [--qc-variant local_flow_wang_end]
+  python -c "from autocoreg.qc.app import main; main(['--sid','790322','--variant','local_flow_wang_end'])"
 """
 from __future__ import annotations
 
 import argparse
 import datetime as _dt
 import json
+import sys
 from pathlib import Path
 
 import cv2
@@ -40,11 +56,13 @@ import tifffile
 from PyQt5 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
+from .. import config as _config
 from ..data import load_sz_pins, subject_inputs
 from ..benchmark_analysis import load_hcr_volume
 
-OUT_ROOT = Path("/tmp/autocoreg_outputs/qc")
-LABELS_ROOT = Path("/tmp/autocoreg_outputs/qc_labels")
+# Artifact inputs + label outputs are resolved from config (env-overridable).
+OUT_ROOT = _config.QC_ARTIFACT_DIR
+LABELS_ROOT = _config.QC_LABELS_DIR
 CUBE_HALF_UM = 60.0
 HCR_LEVEL = 2  # default pyramid level; --level overrides
 
@@ -62,8 +80,15 @@ COLOR_HCR_FAIL_CLS = (180,  60, 200, 200)  # purple (HCR failed ROI classifier)
 WIDTH_CUR   = 4.0
 WIDTH_OTHER = 3.0
 
+# Add-match-mode overlay colors (RGBA)
+COLOR_WARP_CZ      = (255, 215, 0,   255)  # gold    (warped CZ centroid markers)
+COLOR_PICK_CZ      = (0,   255, 255, 255)  # cyan    (CZ pick highlight)
+COLOR_PICK_HCR     = (255, 0,   255, 255)  # magenta (HCR pick highlight)
+COLOR_LANDMARK     = (255, 255, 255, 200)  # white   (active landmark link line)
+COLOR_ADDED_LINK   = (0,   255, 0,   220)  # green   (session-added landmark link)
 
-def parse_args():
+
+def parse_args(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--sid", required=True)
     p.add_argument("--variant", default="local_flow",
@@ -78,7 +103,31 @@ def parse_args():
     p.add_argument("--cz_list", default=None,
                    help="Path to a CSV with a 'cz_id' column; iteration is "
                         "restricted to those IDs (in CSV order).")
-    return p.parse_args()
+    p.add_argument("--matches-csv", dest="matches_csv", default=None,
+                   help="Explicit matcher-output CSV (cz_id,hcr_id[,soma_score]). "
+                        "Overrides the find_final_round_csv lookup under "
+                        "MFISH_QC_MATCHES_DIR.")
+    return p.parse_args(argv)
+
+
+def find_final_round_csv(sid: str, variant: str) -> Path:
+    """Locate the final-round matcher CSV for (sid, variant).
+
+    Looks under ``MFISH_QC_MATCHES_DIR/step3_v2_path_a_<variant>/<sid>/`` and
+    returns the last ``matches_wang_round*.csv`` if any, else the last
+    ``matches_round*.csv``.  (Vendored from the session-15 qc_pair_app so the
+    repo has no flat-module dependency.)
+    """
+    d = _config.QC_MATCHES_DIR / f"step3_v2_path_a_{variant}" / sid
+    wang_rounds = sorted(d.glob("matches_wang_round*.csv"),
+                         key=lambda p: int(p.stem.replace("matches_wang_round", "")))
+    if wang_rounds:
+        return wang_rounds[-1]
+    rounds = sorted(d.glob("matches_round*.csv"),
+                    key=lambda p: int(p.stem.replace("matches_round", "")))
+    if not rounds:
+        raise FileNotFoundError(f"No matches CSVs under {d}")
+    return rounds[-1]
 
 
 def compute_centroids(label_arr: np.ndarray, ids: list[int]) -> dict[int, np.ndarray]:
@@ -139,6 +188,10 @@ class CubeView(QtWidgets.QWidget):
         self.img_cz.setCompositionMode(QtGui.QPainter.CompositionMode_Plus)
         self.plot.addItem(self.img_cz)
         self.contour_items: list[pg.PlotDataItem] = []
+        # Add-match-mode overlay (warped CZ centroid markers, selection
+        # highlights, landmark links) — kept separate from contour_items so it
+        # can be cleared/redrawn independently of the pass/fail contours.
+        self.overlay_items: list[pg.GraphicsObject] = []
         layout = QtWidgets.QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.plot)
@@ -148,6 +201,29 @@ class CubeView(QtWidgets.QWidget):
         for it in self.contour_items:
             self.plot.removeItem(it)
         self.contour_items.clear()
+
+    def clear_overlay(self):
+        for it in self.overlay_items:
+            self.plot.removeItem(it)
+        self.overlay_items.clear()
+
+    def add_scatter(self, xs, ys, *, color, size=10, symbol="o", pen=None):
+        spi = pg.ScatterPlotItem(
+            x=list(xs), y=list(ys), size=size, symbol=symbol,
+            brush=pg.mkBrush(color), pen=(pen if pen is not None else pg.mkPen(None)),
+        )
+        self.plot.addItem(spi)
+        self.overlay_items.append(spi)
+        return spi
+
+    def add_overlay_line(self, x_pts, y_pts, *, color, width=1.5, style=None):
+        pen = pg.mkPen(color=color, width=width)
+        if style is not None:
+            pen.setStyle(style)
+        pdi = pg.PlotDataItem(x_pts, y_pts, pen=pen, connect="all")
+        self.plot.addItem(pdi)
+        self.overlay_items.append(pdi)
+        return pdi
 
     def add_contour(self, x_pts, y_pts, color, width=1.5):
         pen = pg.mkPen(color=color, width=width)
@@ -171,13 +247,15 @@ class CubeView(QtWidgets.QWidget):
 
 class QCApp(QtWidgets.QMainWindow):
     def __init__(self, sid: str, variant: str, cube_um: float, start: int,
-                 hcr_level: int = HCR_LEVEL, cz_list_path: str | None = None):
+                 hcr_level: int = HCR_LEVEL, cz_list_path: str | None = None,
+                 matches_csv: str | None = None):
         super().__init__()
         self.sid = sid
         self.variant = variant
         self.cube_half = float(cube_um)
         self.hcr_level = int(hcr_level)
         self.cz_list_path = cz_list_path
+        self.matches_csv = matches_csv
         self.setWindowTitle(f"QC Qt — {sid} / {variant}")
         self._load_data()
         self._init_state()
@@ -215,9 +293,12 @@ class QCApp(QtWidgets.QMainWindow):
             tifffile.imread(str(fc_path)) if fc_path.exists() else None
         )
 
-        # Matches CSV (Stage 2 if present, else Stage 1)
-        from qc_pair_app import find_final_round_csv
-        matches_csv = find_final_round_csv(self.sid, self.variant)
+        # Matches CSV: explicit override, else final-round lookup.
+        matches_csv = (
+            Path(self.matches_csv) if self.matches_csv
+            else find_final_round_csv(self.sid, self.variant)
+        )
+        print(f"[qt] matches CSV: {matches_csv}")
         self.df_matches = pd.read_csv(matches_csv)
         self.df_matches["cz_id"] = self.df_matches["cz_id"].astype(int)
         self.df_matches["hcr_id"] = self.df_matches["hcr_id"].astype(int)
@@ -263,6 +344,18 @@ class QCApp(QtWidgets.QMainWindow):
         import time as _time
         sz_pins = load_sz_pins()
         inp = subject_inputs(self.sid, sz_pins=sz_pins)
+        # CZ-native + HCR centroids (zyx µm, keyed by id) for the manual-match
+        # TPS.  The app's display "world" is HCR µm, so hcr_um is already in
+        # world coords; the TPS maps CZ-native µm -> HCR µm (same convention as
+        # build_warped_cz_volume).
+        self.cz_native_by_id = {
+            int(i): np.asarray(p, dtype=float)
+            for i, p in zip(inp.cz_ids, inp.cz_um)
+        }
+        self.hcr_by_id = {
+            int(i): np.asarray(p, dtype=float)
+            for i, p in zip(inp.hcr_ids, inp.hcr_um)
+        }
         last_exc = None
         for attempt in range(3):
             try:
@@ -341,6 +434,19 @@ class QCApp(QtWidgets.QMainWindow):
         else:
             self.labels_state = {}
 
+        # Manual-match CSV (function 2, append-only) + prior add/undo events to
+        # replay so the active landmark set resumes across sessions.
+        self.manual_matches_path = (
+            LABELS_ROOT / f"manual_matches_{self.variant}_{self.sid}.csv"
+        )
+        self._prior_manual_events = []
+        if self.manual_matches_path.exists():
+            mm = pd.read_csv(self.manual_matches_path).sort_values("timestamp")
+            self._prior_manual_events = [
+                (str(r.action), int(r.cz_id), int(r.hcr_id))
+                for r in mm.itertuples(index=False)
+            ]
+
         print(f"[qt] {len(self.cz_order)} CZ ROIs ({len(cz_matched_ids)} matched, "
               f"{len(unmatched_only)} unmatched).  "
               f"HCR 488 cube {self.hcr488.shape}, "
@@ -356,6 +462,295 @@ class QCApp(QtWidgets.QMainWindow):
         self.show_hcr_fail_gfp = False
         self.show_hcr_fail_cls = False
         self.mip_mode = False  # toggled by 'm' / radio
+
+        # ---- Add-match mode (function 2) ----
+        self.add_match_mode = False
+        # Active landmark set used to fit the TPS.  Seeded from the matcher's
+        # accepted matches; the operator appends new pairs.  {cz_id: hcr_id}.
+        self.active_pairs: dict[int, int] = {}
+        # Session-added pairs (subset of active_pairs the operator created), in
+        # add order, for undo + audit.
+        self.added_order: list[int] = []
+        # Pending click selection.
+        self.pending_cz_id: int | None = None
+        self.pending_hcr_id: int | None = None
+        # Fitted per-axis TPS (callables) and cache of warped CZ centroids.
+        self._tps = None
+        self.cz_warped_by_id: dict[int, np.ndarray] = {}
+
+        # Seed the active set from accepted matches whose endpoints both have
+        # known native centroids.
+        for cz_id, hcr_id in self.cz_to_hcr.items():
+            if int(cz_id) in self.cz_native_by_id and int(hcr_id) in self.hcr_by_id:
+                self.active_pairs[int(cz_id)] = int(hcr_id)
+        # Replay prior manual add/undo events (resume across sessions).
+        for action, cz, hc in getattr(self, "_prior_manual_events", []):
+            if action == "add" and cz in self.cz_native_by_id and hc in self.hcr_by_id:
+                self.active_pairs[cz] = hc
+                if cz in self.added_order:
+                    self.added_order.remove(cz)
+                self.added_order.append(cz)
+            elif action == "undo" and self.added_order:
+                if cz in self.active_pairs:
+                    self.active_pairs.pop(cz, None)
+                if cz in self.added_order:
+                    self.added_order.remove(cz)
+                orig = self.cz_to_hcr.get(cz)
+                if orig is not None and int(orig) in self.hcr_by_id:
+                    self.active_pairs[cz] = int(orig)
+        self._refit_tps()
+
+    # ---------------- manual-match (function 2) ----------------
+    def _refit_tps(self):
+        """Fit per-axis thin-plate Rbf (CZ-native µm -> HCR µm) from the active
+        landmark set, then refresh the warped CZ centroids.  Needs >= 4 pairs;
+        below that the TPS is left unfit and no warped markers are shown."""
+        from scipy.interpolate import Rbf
+        pairs = [(c, h) for c, h in self.active_pairs.items()
+                 if c in self.cz_native_by_id and h in self.hcr_by_id]
+        if len(pairs) < 4:
+            self._tps = None
+            self.cz_warped_by_id = {}
+            return
+        src = np.array([self.cz_native_by_id[c] for c, _ in pairs])  # (N,3) zyx
+        dst = np.array([self.hcr_by_id[h] for _, h in pairs])        # (N,3) zyx
+        self._tps = [
+            Rbf(src[:, 0], src[:, 1], src[:, 2], dst[:, a],
+                function="thin_plate", smooth=0.0)
+            for a in range(3)
+        ]
+        self._warp_cz_centroids()
+
+    def _warp_cz_centroids(self):
+        """Apply the current TPS to every CZ-native centroid -> world (HCR µm)."""
+        if self._tps is None or not self.cz_native_by_id:
+            self.cz_warped_by_id = {}
+            return
+        ids = list(self.cz_native_by_id.keys())
+        src = np.array([self.cz_native_by_id[i] for i in ids])
+        warped = np.stack(
+            [self._tps[a](src[:, 0], src[:, 1], src[:, 2]) for a in range(3)],
+            axis=1,
+        )
+        self.cz_warped_by_id = {int(i): warped[k] for k, i in enumerate(ids)}
+
+    def _cz_pos(self, cz_id: int) -> np.ndarray | None:
+        """Current world (HCR µm) position of a CZ ROI: TPS-warped centroid if
+        available, else the baked warped-seg centroid."""
+        p = self.cz_warped_by_id.get(int(cz_id))
+        if p is not None:
+            return p
+        return self.cz_world.get(int(cz_id))
+
+    def _nearest_id(self, by_id: dict, x: float, y: float, z: float,
+                    z_tol: float, r_max: float):
+        """Nearest id in a {id: zyx} dict to (x,y) at slice z, within z_tol in z
+        and r_max in-plane.  Returns (id, dist) or (None, inf)."""
+        best, best_d = None, float("inf")
+        for i, p in by_id.items():
+            if abs(p[0] - z) > z_tol:
+                continue
+            d = ((p[2] - x) ** 2 + (p[1] - y) ** 2) ** 0.5
+            if d < best_d:
+                best, best_d = int(i), d
+        if best is None or best_d > r_max:
+            return None, float("inf")
+        return best, best_d
+
+    def _hcr_label_at(self, x: float, y: float, z: float) -> int:
+        """HCR label id at world (x,y,z) µm, looked up in the matched/unmatched
+        HCR seg volumes (0 = background)."""
+        for arr in (self.hcr_matched_arr, self.hcr_unmatched_arr):
+            zv = int(round((z - self.hbb["z_lo"]) / self.hcr_vox_z))
+            yv = int(round((y - self.hbb["y_lo"]) / self.hcr_vox_xy))
+            xv = int(round((x - self.hbb["x_lo"]) / self.hcr_vox_xy))
+            if (0 <= zv < arr.shape[0] and 0 <= yv < arr.shape[1]
+                    and 0 <= xv < arr.shape[2]):
+                v = int(arr[zv, yv, xv])
+                if v != 0:
+                    return v
+        return 0
+
+    def _on_canvas_click(self, ev):
+        """Left-click in add-match mode: first click picks the CZ ROI (nearest
+        warped CZ centroid), second picks the HCR ROI (label under cursor, else
+        nearest HCR centroid)."""
+        if not self.add_match_mode:
+            return
+        if ev.button() != QtCore.Qt.LeftButton:
+            return
+        vb = self.view.plot.getViewBox()
+        if not self.view.plot.sceneBoundingRect().contains(ev.scenePos()):
+            return
+        pt = vb.mapSceneToView(ev.scenePos())
+        x, y, z = float(pt.x()), float(pt.y()), self.cur_z_world
+        z_tol = max(self.cube_half, 8.0)
+        if self.pending_cz_id is None:
+            cz_id, d = self._nearest_id(
+                self.cz_warped_by_id or self.cz_world, x, y, z,
+                z_tol=z_tol, r_max=self.cube_half)
+            if cz_id is None:
+                self._set_match_status("no CZ ROI near click")
+                return
+            self.pending_cz_id = cz_id
+            self._set_match_status(f"CZ picked: cz_id={cz_id} (d={d:.1f}µm). "
+                                   f"Now click its HCR cell.")
+        elif self.pending_hcr_id is None:
+            hcr_id = self._hcr_label_at(x, y, z)
+            if hcr_id == 0:
+                hcr_id, _ = self._nearest_id(self.hcr_by_id, x, y, z,
+                                             z_tol=z_tol, r_max=self.cube_half)
+            if hcr_id is None or hcr_id == 0:
+                self._set_match_status("no HCR ROI near click")
+                return
+            self.pending_hcr_id = int(hcr_id)
+            self._set_match_status(self._pending_summary())
+        else:
+            # Both already set — restart selection at this click.
+            self.pending_cz_id = None
+            self.pending_hcr_id = None
+            self._on_canvas_click(ev)
+            return
+        self._update_match_buttons()
+        self._redraw_contours_only()
+
+    def _pending_summary(self) -> str:
+        cz, hc = self.pending_cz_id, self.pending_hcr_id
+        if cz is None or hc is None:
+            return ""
+        wp = self._cz_pos(cz)
+        hp = self.hcr_by_id.get(hc)
+        dist = (float(np.linalg.norm(wp - hp)) if wp is not None and hp is not None
+                else float("nan"))
+        existing = ""
+        if cz in self.active_pairs and self.active_pairs[cz] != hc:
+            existing = f"  (replaces hcr_id={self.active_pairs[cz]})"
+        return (f"pair: cz_id={cz} ↔ hcr_id={hc}  warp-dist={dist:.1f}µm{existing}"
+                f"\nEnter=add  Esc=reset")
+
+    def _add_pair(self):
+        if self.pending_cz_id is None or self.pending_hcr_id is None:
+            self._set_match_status("pick a CZ ROI then an HCR ROI first")
+            return
+        cz, hc = self.pending_cz_id, self.pending_hcr_id
+        if cz not in self.cz_native_by_id or hc not in self.hcr_by_id:
+            self._set_match_status(f"missing centroid for cz_id={cz}/hcr_id={hc}")
+            return
+        self.active_pairs[cz] = hc
+        if cz in self.added_order:
+            self.added_order.remove(cz)
+        self.added_order.append(cz)
+        self._refit_tps()
+        self._save_manual_match(cz, hc, "add")
+        self.pending_cz_id = None
+        self.pending_hcr_id = None
+        self._set_match_status(self._counts_summary() + "  (added, TPS refit)")
+        self._update_match_buttons()
+        self._redraw()
+
+    def _undo_pair(self):
+        if not self.added_order:
+            self._set_match_status("nothing to undo")
+            return
+        cz = self.added_order.pop()
+        hc = self.active_pairs.pop(cz, None)
+        # If the cz was originally a seeded match, restore that mapping.
+        orig = self.cz_to_hcr.get(cz)
+        if orig is not None and int(orig) in self.hcr_by_id:
+            self.active_pairs[cz] = int(orig)
+        self._refit_tps()
+        self._save_manual_match(cz, hc if hc is not None else -1, "undo")
+        self._set_match_status(self._counts_summary() + f"  (undid cz_id={cz})")
+        self._update_match_buttons()
+        self._redraw()
+
+    def _reset_selection(self):
+        self.pending_cz_id = None
+        self.pending_hcr_id = None
+        self._set_match_status("selection reset")
+        self._update_match_buttons()
+        self._redraw_contours_only()
+
+    def _counts_summary(self) -> str:
+        return (f"active landmarks: {len(self.active_pairs)}  |  "
+                f"session-added: {len(self.added_order)}")
+
+    def _save_manual_match(self, cz_id: int, hcr_id: int, action: str):
+        LABELS_ROOT.mkdir(parents=True, exist_ok=True)
+        ts = _dt.datetime.now().isoformat(timespec="seconds")
+        write_header = not self.manual_matches_path.exists()
+        with open(self.manual_matches_path, "a") as f:
+            if write_header:
+                f.write("timestamp,action,cz_id,hcr_id,n_active\n")
+            f.write(f"{ts},{action},{cz_id},{hcr_id},{len(self.active_pairs)}\n")
+        print(f"[match] {action} cz_id={cz_id} hcr_id={hcr_id} "
+              f"n_active={len(self.active_pairs)}")
+
+    def _draw_match_overlay(self):
+        """Overlay for add-match mode: warped CZ centroid markers (gold) visible
+        in the current slice, plus highlights + a link line for the pending
+        selection.  Cleared (and skipped) when add-match mode is off."""
+        self.view.clear_overlay()
+        if not self.add_match_mode:
+            return
+        (vy_lo, vy_hi), (vx_lo, vx_hi) = self._viewport_xy_range()
+        if self.mip_mode:
+            z_lo, z_hi = self.mip_z_world
+        else:
+            z_tol = max(self.cube_half, 8.0)
+            z_lo, z_hi = self.cur_z_world - z_tol, self.cur_z_world + z_tol
+        xs, ys = [], []
+        for cz_id, p in self.cz_warped_by_id.items():
+            if not (z_lo <= p[0] <= z_hi):
+                continue
+            if not (vx_lo <= p[2] <= vx_hi and vy_lo <= p[1] <= vy_hi):
+                continue
+            if cz_id == self.pending_cz_id:
+                continue
+            xs.append(p[2]); ys.append(p[1])
+        if xs:
+            self.view.add_scatter(xs, ys, color=COLOR_WARP_CZ, size=7, symbol="o")
+        if self.pending_cz_id is not None:
+            cp = self._cz_pos(self.pending_cz_id)
+            if cp is not None:
+                self.view.add_scatter([cp[2]], [cp[1]], color=(0, 0, 0, 0),
+                                      size=18, symbol="o",
+                                      pen=pg.mkPen(COLOR_PICK_CZ, width=3))
+        if self.pending_hcr_id is not None:
+            hp = self.hcr_by_id.get(self.pending_hcr_id)
+            if hp is not None:
+                self.view.add_scatter([hp[2]], [hp[1]], color=(0, 0, 0, 0),
+                                      size=18, symbol="o",
+                                      pen=pg.mkPen(COLOR_PICK_HCR, width=3))
+                cp = self._cz_pos(self.pending_cz_id) if self.pending_cz_id else None
+                if cp is not None:
+                    self.view.add_overlay_line([cp[2], hp[2]], [cp[1], hp[1]],
+                                               color=COLOR_ADDED_LINK, width=2)
+
+    def _toggle_add_match(self):
+        self.add_match_mode = self.chk_add_match.isChecked()
+        self.match_box.setVisible(self.add_match_mode)
+        # Disable the pass/fail radio while matching (avoid stray labels).
+        self.radio_box.setEnabled(not self.add_match_mode)
+        if not self.add_match_mode:
+            self.pending_cz_id = None
+            self.pending_hcr_id = None
+        else:
+            self._set_match_status(
+                self._counts_summary() + "\nclick a CZ ROI, then its HCR cell")
+        self._update_match_buttons()
+        self._redraw()
+
+    def _set_match_status(self, msg: str):
+        if hasattr(self, "lbl_match"):
+            self.lbl_match.setText(msg)
+
+    def _update_match_buttons(self):
+        if not hasattr(self, "btn_add_pair"):
+            return
+        self.btn_add_pair.setEnabled(
+            self.pending_cz_id is not None and self.pending_hcr_id is not None)
+        self.btn_undo_pair.setEnabled(len(self.added_order) > 0)
 
     # ---------------- UI ----------------
     def _build_ui(self):
@@ -451,6 +846,32 @@ class QCApp(QtWidgets.QMainWindow):
         self.radio_group = QtWidgets.QButtonGroup()
         pl.addWidget(self.radio_box)
 
+        # ---- Add-match mode (function 2) ----
+        self.chk_add_match = QtWidgets.QCheckBox("Add-match mode (a)")
+        self.chk_add_match.setChecked(False)
+        self.chk_add_match.stateChanged.connect(lambda _: self._toggle_add_match())
+        pl.addWidget(self.chk_add_match)
+
+        self.match_box = QtWidgets.QGroupBox("Manual match (TPS re-warp)")
+        mbl = QtWidgets.QVBoxLayout()
+        self.match_box.setLayout(mbl)
+        self.lbl_match = QtWidgets.QLabel("click a CZ ROI, then its HCR cell")
+        self.lbl_match.setWordWrap(True)
+        mbl.addWidget(self.lbl_match)
+        mrow = QtWidgets.QHBoxLayout()
+        self.btn_add_pair = QtWidgets.QPushButton("Add pair (Enter)")
+        self.btn_add_pair.clicked.connect(self._add_pair)
+        self.btn_reset_sel = QtWidgets.QPushButton("Reset (Esc)")
+        self.btn_reset_sel.clicked.connect(self._reset_selection)
+        mrow.addWidget(self.btn_add_pair)
+        mrow.addWidget(self.btn_reset_sel)
+        mbl.addLayout(mrow)
+        self.btn_undo_pair = QtWidgets.QPushButton("Undo last add (Backspace)")
+        self.btn_undo_pair.clicked.connect(self._undo_pair)
+        mbl.addWidget(self.btn_undo_pair)
+        self.match_box.setVisible(False)
+        pl.addWidget(self.match_box)
+
         # Nav buttons
         nav_row = QtWidgets.QHBoxLayout()
         b_prev = QtWidgets.QPushButton("← Prev")
@@ -485,6 +906,14 @@ class QCApp(QtWidgets.QMainWindow):
         self._mk_shortcut("s", lambda: self.rad_slice.setChecked(True))
         self._mk_shortcut("f", lambda: self.chk_hcr_fail_gfp.toggle())
         self._mk_shortcut("r", lambda: self.chk_hcr_fail_cls.toggle())
+        self._mk_shortcut("a", lambda: self.chk_add_match.toggle())
+        self._mk_shortcut("Return", self._add_pair)
+        self._mk_shortcut("Enter", self._add_pair)
+        self._mk_shortcut("Backspace", self._undo_pair)
+        self._mk_shortcut("Escape", self._reset_selection)
+
+        # Mouse picking for add-match mode.
+        self.view.plot.scene().sigMouseClicked.connect(self._on_canvas_click)
 
         # Debounced re-draw of contours on pan/zoom (so contours always cover
         # the visible viewport, not just the cube).
@@ -506,6 +935,7 @@ class QCApp(QtWidgets.QMainWindow):
         else:
             self._draw_cz_contours_at_z(self.cur_z_world)
             self._draw_hcr_contours_at_z(self.cur_z_world)
+        self._draw_match_overlay()
 
     def _mk_shortcut(self, key, fn):
         sc = QtWidgets.QShortcut(QtGui.QKeySequence(key), self)
@@ -778,6 +1208,7 @@ class QCApp(QtWidgets.QMainWindow):
         else:
             self._draw_cz_contours_at_z(z_world)
             self._draw_hcr_contours_at_z(z_world)
+        self._draw_match_overlay()
         # Initial viewport: cube ± 10% margin (20% larger than cube extent)
         if not getattr(self, "_viewport_set_for_idx", None) == self.show_idx:
             ex = bb["x_hi"] - bb["x_lo"]; ey = bb["y_hi"] - bb["y_lo"]
@@ -1017,12 +1448,23 @@ class QCApp(QtWidgets.QMainWindow):
         print(f"[label] idx={self.show_idx+1} cz_id={cz_id} {'matched' if self.cur_matched else 'unmatched'} → {label}")
 
 
-def main():
-    args = parse_args()
+def launch(sid: str, variant: str = "local_flow", cube_um: float = CUBE_HALF_UM,
+           start: int = 0, hcr_level: int = HCR_LEVEL,
+           cz_list_path: str | None = None, matches_csv: str | None = None):
+    """Build the QC window and return (QApplication, QCApp) without entering the
+    event loop.  Callers that want a blocking GUI call ``app.exec_()`` after."""
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
-    win = QCApp(args.sid, args.variant, args.cube_um, args.start, args.level,
-                cz_list_path=args.cz_list)
+    win = QCApp(sid, variant, cube_um, start, hcr_level,
+                cz_list_path=cz_list_path, matches_csv=matches_csv)
     win.show()
+    return app, win
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    app, _win = launch(args.sid, args.variant, args.cube_um, args.start,
+                       args.level, cz_list_path=args.cz_list,
+                       matches_csv=args.matches_csv)
     sys.exit(app.exec_())
 
 
