@@ -36,6 +36,7 @@ src/autocoreg/sz_estimator.py
 src/autocoreg/benchmark/__init__.py
 src/autocoreg/qc/__init__.py
 src/autocoreg/qc/app.py
+src/autocoreg/qc/build_artifacts.py
 src/mfish_autocoreg.egg-info/PKG-INFO
 src/mfish_autocoreg.egg-info/SOURCES.txt
 src/mfish_autocoreg.egg-info/dependency_links.txt
