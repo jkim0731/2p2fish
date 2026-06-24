@@ -1,2 +1,3 @@
 [console_scripts]
 autocoreg = autocoreg.cli:main
+autocoreg_qc = autocoreg.qc.launcher:main

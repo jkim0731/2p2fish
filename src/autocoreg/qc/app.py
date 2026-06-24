@@ -26,6 +26,7 @@ Add-match mode (function 2 — manual registration improvement):
 Keys:
   → / ←  next / prev CZ ROI
   ↑ / ↓  Z slice ±1 (slice mode only)
+  Shift+wheel  Z slice ±1 (slice mode; plain wheel = zoom)
   s / m  switch to slice / MIP-cube-Z mode
   1 / 2 / 3   select radio option (top to bottom)
   4          toggle HCR 488 image
@@ -33,7 +34,7 @@ Keys:
   c          toggle "other CZ ROIs"
   h          toggle "other HCR ROIs"
   a          toggle add-match mode
-  Enter      add the pending CZ↔HCR pair (add-match mode)
+  Enter      next ROI if labeled (QC mode) / add pending pair (add-match mode)
   Backspace  undo last added pair (add-match mode)
   Esc        reset the pending selection (add-match mode)
 
@@ -86,6 +87,23 @@ COLOR_PICK_CZ      = (0,   255, 255, 255)  # cyan    (CZ pick highlight)
 COLOR_PICK_HCR     = (255, 0,   255, 255)  # magenta (HCR pick highlight)
 COLOR_LANDMARK     = (255, 255, 255, 200)  # white   (active landmark link line)
 COLOR_ADDED_LINK   = (0,   255, 0,   220)  # green   (session-added landmark link)
+
+
+# Export: fixed column order for the positions CSV / clipboard (BOTH coord frames).
+POS_COLS = [
+    "cz_id", "hcr_id", "soma_score",
+    "cz_native_z_um", "cz_native_y_um", "cz_native_x_um",
+    "cz_native_z_px", "cz_native_y_px", "cz_native_x_px",
+    "cz_in_hcr_z_um", "cz_in_hcr_y_um", "cz_in_hcr_x_um",
+    "hcr_z_um", "hcr_y_um", "hcr_x_um",
+    "hcr_z_px", "hcr_y_px", "hcr_x_px",
+]
+
+
+def _fmt_val(v):
+    if isinstance(v, float):
+        return "" if v != v else f"{v:.3f}"   # NaN -> ""
+    return str(v)
 
 
 def parse_args(argv=None):
@@ -371,6 +389,15 @@ class QCApp(QtWidgets.QMainWindow):
             int(i): np.asarray(p, dtype=float)
             for i, p in zip(inp.hcr_ids, inp.hcr_um)
         }
+        # Kept for the Export feature: subject handle + native resolutions (µm/px)
+        # and an exports dir (under the labels root, /scratch per storage rule).
+        self.s = inp.s
+        self.cz_xy_um = float(inp.s.cz_xy_um)
+        self.cz_z_um = float(inp.s.cz_z_um)
+        self.hcr_xy_um = float(inp.s.hcr_xy_um)
+        self.hcr_z_um = float(inp.s.hcr_z_um)
+        self.export_dir = LABELS_ROOT / f"exports_{self.sid}"
+        self.export_dir.mkdir(parents=True, exist_ok=True)
         last_exc = None
         for attempt in range(3):
             try:
@@ -551,6 +578,8 @@ class QCApp(QtWidgets.QMainWindow):
         self.cur_z_world = 0.0
         self.show_other_cz = True
         self.show_other_hcr = True
+        self.show_cur_cz = True   # current pair's CZ ROI contour
+        self.show_cur_hcr = True  # current pair's matched HCR ROI contour
         self.show_czw = True
         self.show_hcr488 = True
         self.show_hcr_fail_gfp = False
@@ -857,11 +886,15 @@ class QCApp(QtWidgets.QMainWindow):
         self.view = CubeView()
         h.addWidget(self.view, stretch=4)
 
-        # Right control panel
+        # Right control panel — kept narrow so the image gets the space.
         panel = QtWidgets.QWidget()
+        panel.setMaximumWidth(240)
+        panel.setMinimumWidth(200)
         pl = QtWidgets.QVBoxLayout()
+        pl.setContentsMargins(4, 4, 4, 4)
+        pl.setSpacing(4)
         panel.setLayout(pl)
-        h.addWidget(panel, stretch=1)
+        h.addWidget(panel, stretch=0)
 
         self.lbl_status = QtWidgets.QLabel("…")
         self.lbl_status.setStyleSheet("font-weight: bold;")
@@ -942,6 +975,14 @@ class QCApp(QtWidgets.QMainWindow):
         mode_layout.addWidget(self.rad_mip)
         pl.addWidget(mode_box)
 
+        self.chk_cur_cz = QtWidgets.QCheckBox("Pair CZ ROI (z)")
+        self.chk_cur_cz.setChecked(True)
+        self.chk_cur_cz.stateChanged.connect(lambda _: self._toggle_cur_cz())
+        pl.addWidget(self.chk_cur_cz)
+        self.chk_cur_hcr = QtWidgets.QCheckBox("Pair HCR ROI (x)")
+        self.chk_cur_hcr.setChecked(True)
+        self.chk_cur_hcr.stateChanged.connect(lambda _: self._toggle_cur_hcr())
+        pl.addWidget(self.chk_cur_hcr)
         self.chk_other_cz = QtWidgets.QCheckBox("Other CZ ROIs (c)")
         self.chk_other_cz.setChecked(True)
         self.chk_other_cz.stateChanged.connect(lambda _: self._toggle_other_cz())
@@ -993,6 +1034,23 @@ class QCApp(QtWidgets.QMainWindow):
         self.match_box.setVisible(False)
         pl.addWidget(self.match_box)
 
+        # ---- Export (XYZ positions + HCR seg crop) ----
+        exp_box = QtWidgets.QGroupBox("Export")
+        el = QtWidgets.QVBoxLayout(); exp_box.setLayout(el)
+        b_copy = QtWidgets.QPushButton("Copy pair XYZ (p)")
+        b_copy.setToolTip("Copy current pair's XYZ in czstack-native + HCR coords to clipboard")
+        b_copy.clicked.connect(self._copy_positions)
+        b_allpos = QtWidgets.QPushButton("Export all positions CSV")
+        b_allpos.clicked.connect(self._export_all_positions)
+        b_segcrop = QtWidgets.QPushButton("Export HCR seg crop")
+        b_segcrop.setToolTip("Save raw HCR segmentation labels near this pair as a tif")
+        b_segcrop.clicked.connect(self._export_hcr_seg_crop)
+        el.addWidget(b_copy); el.addWidget(b_allpos); el.addWidget(b_segcrop)
+        self.lbl_export = QtWidgets.QLabel("")
+        self.lbl_export.setWordWrap(True)
+        el.addWidget(self.lbl_export)
+        pl.addWidget(exp_box)
+
         # Nav buttons
         nav_row = QtWidgets.QHBoxLayout()
         b_prev = QtWidgets.QPushButton("← Prev")
@@ -1021,6 +1079,9 @@ class QCApp(QtWidgets.QMainWindow):
         self._mk_shortcut("3", lambda: self._click_radio(2))
         self._mk_shortcut("c", lambda: self.chk_other_cz.toggle())
         self._mk_shortcut("h", lambda: self.chk_other_hcr.toggle())
+        self._mk_shortcut("z", lambda: self.chk_cur_cz.toggle())
+        self._mk_shortcut("x", lambda: self.chk_cur_hcr.toggle())
+        self._mk_shortcut("p", self._copy_positions)
         self._mk_shortcut("4", lambda: self.chk_hcr488.toggle())  # 4 → 488 image
         self._mk_shortcut("w", lambda: self.chk_czw.toggle())     # w → warped CZ image
         self._mk_shortcut("m", lambda: self.rad_mip.setChecked(True))
@@ -1028,13 +1089,15 @@ class QCApp(QtWidgets.QMainWindow):
         self._mk_shortcut("f", lambda: self.chk_hcr_fail_gfp.toggle())
         self._mk_shortcut("r", lambda: self.chk_hcr_fail_cls.toggle())
         self._mk_shortcut("a", lambda: self.chk_add_match.toggle())
-        self._mk_shortcut("Return", self._add_pair)
-        self._mk_shortcut("Enter", self._add_pair)
+        self._mk_shortcut("Return", self._enter_pressed)
+        self._mk_shortcut("Enter", self._enter_pressed)
         self._mk_shortcut("Backspace", self._undo_pair)
         self._mk_shortcut("Escape", self._reset_selection)
 
         # Mouse picking for add-match mode.
         self.view.plot.scene().sigMouseClicked.connect(self._on_canvas_click)
+        # Shift + mouse-wheel over the image steps the Z slice (plain wheel = zoom).
+        self.view.plot.viewport().installEventFilter(self)
 
         # Debounced re-draw of contours on pan/zoom (so contours always cover
         # the visible viewport, not just the cube).
@@ -1074,6 +1137,7 @@ class QCApp(QtWidgets.QMainWindow):
             "ticks": [(0.0, (0, 0, 0, 255)), (1.0, (*gradient_rgb, 255))],
         })
         hist.setMaximumHeight(110)
+        hist.setMaximumWidth(230)
         parent_layout.addWidget(hist)
 
         row = QtWidgets.QHBoxLayout()
@@ -1283,6 +1347,20 @@ class QCApp(QtWidgets.QMainWindow):
     def _z_down(self):
         self.z_slider.setValue(max(self.z_slider.value() - 1, 0))
 
+    def eventFilter(self, obj, ev):
+        """Shift+wheel over the image = step Z (slice mode); consume so it doesn't
+        also zoom.  Plain wheel falls through to pyqtgraph's zoom."""
+        if (ev.type() == QtCore.QEvent.Wheel
+                and (ev.modifiers() & QtCore.Qt.ShiftModifier)):
+            if not self.mip_mode:
+                dy = ev.angleDelta().y()
+                if dy > 0:
+                    self._z_up()
+                elif dy < 0:
+                    self._z_down()
+            return True  # consume (no zoom) whenever Shift is held
+        return super().eventFilter(obj, ev)
+
     def _redraw(self):
         bb = self.cube_bb
         z_world = self.cur_z_world
@@ -1337,11 +1415,19 @@ class QCApp(QtWidgets.QMainWindow):
             self._draw_cz_contours_at_z(z_world)
             self._draw_hcr_contours_at_z(z_world)
         self._draw_match_overlay()
-        # Initial viewport: cube ± 10% margin (20% larger than cube extent)
+        # Viewport on ROI change: first ROI -> cube ± 10%; later ROIs -> keep the
+        # current zoom (span) and just recenter on the new ROI.
         if not getattr(self, "_viewport_set_for_idx", None) == self.show_idx:
-            ex = bb["x_hi"] - bb["x_lo"]; ey = bb["y_hi"] - bb["y_lo"]
-            self.view.plot.setXRange(bb["x_lo"] - 0.1 * ex, bb["x_hi"] + 0.1 * ex, padding=0)
-            self.view.plot.setYRange(bb["y_lo"] - 0.1 * ey, bb["y_hi"] + 0.1 * ey, padding=0)
+            cx = 0.5 * (bb["x_lo"] + bb["x_hi"]); cy = 0.5 * (bb["y_lo"] + bb["y_hi"])
+            if getattr(self, "_have_view", False):
+                (vx_lo, vx_hi), (vy_lo, vy_hi) = self.view.plot.viewRange()
+                hx = 0.5 * (vx_hi - vx_lo); hy = 0.5 * (vy_hi - vy_lo)
+            else:
+                ex = bb["x_hi"] - bb["x_lo"]; ey = bb["y_hi"] - bb["y_lo"]
+                hx = 0.6 * ex; hy = 0.6 * ey  # cube + 10% margin each side
+                self._have_view = True
+            self.view.plot.setXRange(cx - hx, cx + hx, padding=0)
+            self.view.plot.setYRange(cy - hy, cy + hy, padding=0)
             self._viewport_set_for_idx = self.show_idx
 
     def _viewport_xy_range(self):
@@ -1373,6 +1459,8 @@ class QCApp(QtWidgets.QMainWindow):
             for v in uniq.tolist():
                 v = int(v)
                 if v == self.cur_cz_id:
+                    if not self.show_cur_cz:
+                        continue
                     color = COLOR_CUR_CZ; width = WIDTH_CUR
                 elif not self.show_other_cz:
                     continue
@@ -1417,6 +1505,8 @@ class QCApp(QtWidgets.QMainWindow):
                 if not is_failed:
                     is_matched_hcr = (self.cur_matched and v == self.cur_hcr_id)
                     if is_matched_hcr:
+                        if not self.show_cur_hcr:
+                            continue
                         color = COLOR_CUR_HCR; width = WIDTH_CUR
                     elif not self.show_other_hcr:
                         continue
@@ -1457,6 +1547,8 @@ class QCApp(QtWidgets.QMainWindow):
             for v in uniq.tolist():
                 v = int(v)
                 if v == self.cur_cz_id:
+                    if not self.show_cur_cz:
+                        continue
                     color = COLOR_CUR_CZ; width = WIDTH_CUR
                 elif not self.show_other_cz:
                     continue
@@ -1498,6 +1590,8 @@ class QCApp(QtWidgets.QMainWindow):
                 if not is_failed:
                     is_matched_hcr = (self.cur_matched and v == self.cur_hcr_id)
                     if is_matched_hcr:
+                        if not self.show_cur_hcr:
+                            continue
                         color = COLOR_CUR_HCR; width = WIDTH_CUR
                     elif not self.show_other_hcr:
                         continue
@@ -1523,6 +1617,33 @@ class QCApp(QtWidgets.QMainWindow):
     def _prev(self):
         self.show_idx = (self.show_idx - 1) % len(self.cz_order)
         self._refresh_pair()
+
+    def _enter_pressed(self):
+        """Enter = add pair (add-match mode), else advance only if the current ROI
+        has a decision (label)."""
+        if self.add_match_mode:
+            self._add_pair()
+        else:
+            self._next_if_labeled()
+
+    def _next_if_labeled(self):
+        if self.labels_state.get(self.cur_cz_id):
+            self._next()
+        else:
+            kind = "good/bad/unsure" if self.cur_matched else "visible/not-visible"
+            self._notify(f"Not labeled — pick {kind} before Enter (use → to skip).")
+
+    def _notify(self, msg, ms=3000):
+        self.statusBar().showMessage(msg, ms)
+        print("[notify]", msg)
+
+    def _toggle_cur_cz(self):
+        self.show_cur_cz = self.chk_cur_cz.isChecked()
+        self._redraw_contours_only()
+
+    def _toggle_cur_hcr(self):
+        self.show_cur_hcr = self.chk_cur_hcr.isChecked()
+        self._redraw_contours_only()
 
     def _toggle_other_cz(self):
         self.show_other_cz = self.chk_other_cz.isChecked()
@@ -1574,6 +1695,92 @@ class QCApp(QtWidgets.QMainWindow):
         s = self.lbl_status.text().split("\n")[0]
         self.lbl_status.setText(s + f"\nlabel: <b>{label}</b>  (saved)")
         print(f"[label] idx={self.show_idx+1} cz_id={cz_id} {'matched' if self.cur_matched else 'unmatched'} → {label}")
+
+    # ---------------- export (positions + HCR seg crop) ----------------
+    def _positions_for(self, cz_id) -> dict:
+        """XYZ for a CZ ROI in BOTH frames: czstack-native (µm + px), CZ warped into
+        HCR µm, and the matched HCR cell (HCR µm + px). Missing parts omitted."""
+        cz_id = int(cz_id)
+        hcr = self.cz_to_hcr.get(cz_id)
+        d = {"cz_id": cz_id,
+             "hcr_id": int(hcr) if hcr is not None else -1,
+             "soma_score": float(self.cz_to_soma.get(cz_id, float("nan")))}
+        cn = self.cz_native_by_id.get(cz_id)
+        if cn is not None:
+            d.update(cz_native_z_um=float(cn[0]), cz_native_y_um=float(cn[1]),
+                     cz_native_x_um=float(cn[2]),
+                     cz_native_z_px=cn[0] / self.cz_z_um,
+                     cz_native_y_px=cn[1] / self.cz_xy_um,
+                     cz_native_x_px=cn[2] / self.cz_xy_um)
+        cw = self._cz_pos(cz_id)
+        if cw is not None:
+            d.update(cz_in_hcr_z_um=float(cw[0]), cz_in_hcr_y_um=float(cw[1]),
+                     cz_in_hcr_x_um=float(cw[2]))
+        if hcr is not None:
+            hp = self.hcr_by_id.get(int(hcr))
+            if hp is not None:
+                d.update(hcr_z_um=float(hp[0]), hcr_y_um=float(hp[1]),
+                         hcr_x_um=float(hp[2]),
+                         hcr_z_px=hp[0] / self.hcr_z_um,
+                         hcr_y_px=hp[1] / self.hcr_xy_um,
+                         hcr_x_px=hp[2] / self.hcr_xy_um)
+        return d
+
+    def _copy_positions(self):
+        d = self._positions_for(self.cur_cz_id)
+        hdr = ",".join(POS_COLS)
+        row = ",".join(_fmt_val(d.get(c, "")) for c in POS_COLS)
+        QtWidgets.QApplication.clipboard().setText(hdr + "\n" + row)
+        self._set_export_status("copied pair XYZ (both frames) to clipboard")
+        print("[export] copied pair XYZ:\n" + hdr + "\n" + row)
+
+    def _export_all_positions(self):
+        out = self.export_dir / f"positions_{self.sid}.csv"
+        rows = [self._positions_for(c) for c in self.cz_order]
+        with open(out, "w") as f:
+            f.write(",".join(POS_COLS) + "\n")
+            for d in rows:
+                f.write(",".join(_fmt_val(d.get(c, "")) for c in POS_COLS) + "\n")
+        self._set_export_status(f"wrote {len(rows)} positions → {out.name}")
+        print(f"[export] {len(rows)} positions -> {out}")
+
+    def _export_hcr_seg_crop(self):
+        """Raw HCR segmentation labels cropped ±cube_half µm around the current pair
+        (HCR µm frame), as a label tif + meta json — for downstream analysis/plots."""
+        center = (self.hcr_by_id.get(self.cur_hcr_id) if self.cur_matched
+                  else self._cz_pos(self.cur_cz_id))
+        if center is None:
+            self._set_export_status("no HCR location for this ROI")
+            return
+        from .build_artifacts import open_hcr_seg_zarr_array
+        slicer, (Z, Y, X), xy_um, z_um = open_hcr_seg_zarr_array(self.s)
+        h = float(self.cube_half)
+        z0 = max(0, int((center[0] - h) / z_um)); z1 = min(Z, int((center[0] + h) / z_um) + 1)
+        y0 = max(0, int((center[1] - h) / xy_um)); y1 = min(Y, int((center[1] + h) / xy_um) + 1)
+        x0 = max(0, int((center[2] - h) / xy_um)); x1 = min(X, int((center[2] + h) / xy_um) + 1)
+        crop = np.asarray(slicer(slice(z0, z1), slice(y0, y1), slice(x0, x1)),
+                          dtype=np.int32)
+        tag = f"cz{self.cur_cz_id}" + (f"_hcr{self.cur_hcr_id}" if self.cur_matched
+                                       else "_unmatched")
+        tif = self.export_dir / f"hcr_seg_crop_{self.sid}_{tag}.tif"
+        # Native-res labels are ~99% background -> zlib shrinks the file ~50x.
+        tifffile.imwrite(str(tif), crop, compression="zlib")
+        n_labels = int(np.count_nonzero(np.unique(crop)))
+        meta = dict(
+            sid=self.sid, cz_id=int(self.cur_cz_id),
+            hcr_id=int(self.cur_hcr_id) if self.cur_matched else None,
+            center_hcr_um=[float(v) for v in center],
+            origin_um=[z0 * z_um, y0 * xy_um, x0 * xy_um],
+            voxel_um=[float(z_um), float(xy_um), float(xy_um)],
+            shape=list(crop.shape), half_um=h, n_labels=n_labels,
+        )
+        tif.with_suffix(".json").write_text(json.dumps(meta, indent=2))
+        self._set_export_status(f"HCR seg crop {crop.shape} ({n_labels} cells) → {tif.name}")
+        print(f"[export] HCR seg crop {crop.shape} ({n_labels} cells) -> {tif}")
+
+    def _set_export_status(self, msg):
+        if hasattr(self, "lbl_export"):
+            self.lbl_export.setText(msg)
 
 
 def launch(sid: str, variant: str = "step3_v3_anchor_vote_wang_end",

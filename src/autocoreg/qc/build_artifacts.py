@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import glob
 import json
+import multiprocessing as mp
+import os
 import time
 from pathlib import Path
 
@@ -33,6 +35,39 @@ from scipy.ndimage import map_coordinates
 from .. import config as _config
 from ..cz_volume import load_cz_volume
 from ..data import load_sz_pins, subject_inputs
+
+# Default output voxel size (µm) for the warped CZ image + CZ/HCR seg overlays.
+# 2.0 µm gives crisp ROI boundaries + CZ image (4.0 was blocky); env-overridable.
+DEFAULT_VOXEL_UM = float(os.environ.get("MFISH_QC_VOXEL_UM", "2.0"))
+
+# Shared read-only context for the parallel inverse-TPS warp (fork-inherited).
+_WARP_CTX: dict = {}
+
+
+def _warp_zslice_chunk(k_range):
+    """Warp a contiguous block of output z-slices (CZ seg order-0 + CZ image
+    order-1) using the fork-inherited ``_WARP_CTX``.  Returns (k0, cz_block,
+    img_block)."""
+    c = _WARP_CTX
+    rbf, Y_flat, X_flat = c["rbf"], c["Y_flat"], c["X_flat"]
+    z_lo, vox = c["z_lo"], c["vox"]
+    cz_z_um, cz_xy_um = c["cz_z_um"], c["cz_xy_um"]
+    cz_seg, cz_vol, ny, nx = c["cz_seg"], c["cz_vol"], c["ny"], c["nx"]
+    ks = list(k_range)
+    cz_block = np.zeros((len(ks), ny, nx), dtype=np.int32)
+    img_block = np.zeros((len(ks), ny, nx), dtype=np.float32)
+    for idx, k in enumerate(ks):
+        z = z_lo + (k + 0.5) * vox
+        Z_flat = np.full_like(Y_flat, z)
+        cz_z_vox = rbf[0](Z_flat, Y_flat, X_flat) / cz_z_um
+        cz_y_vox = rbf[1](Z_flat, Y_flat, X_flat) / cz_xy_um
+        cz_x_vox = rbf[2](Z_flat, Y_flat, X_flat) / cz_xy_um
+        coords = np.stack([cz_z_vox, cz_y_vox, cz_x_vox])
+        cz_block[idx] = map_coordinates(
+            cz_seg, coords, order=0, mode="constant", cval=0).reshape(ny, nx)
+        img_block[idx] = map_coordinates(
+            cz_vol, coords, order=1, mode="constant", cval=0.0).reshape(ny, nx)
+    return ks[0], cz_block, img_block
 
 
 def final_round_csv(sid_out_dir) -> Path:
@@ -132,7 +167,7 @@ def build_qc_artifacts(
     matches_csv,
     out_dir,
     *,
-    voxel_um: float = 4.0,
+    voxel_um: float = DEFAULT_VOXEL_UM,
     margin_um: float = 30.0,
     sz_pins: dict | None = None,
     write_failed: bool = True,
@@ -196,19 +231,33 @@ def build_qc_artifacts(
     Y, X = np.meshgrid(y_centers, x_centers, indexing="ij")
     Y_flat, X_flat = Y.ravel(), X.ravel()
     t = time.time()
-    for k in range(nz):
-        z = z_lo + (k + 0.5) * vox
-        Z_flat = np.full_like(Y_flat, z)
-        cz_z_vox = rbf[0](Z_flat, Y_flat, X_flat) / cz_z_um
-        cz_y_vox = rbf[1](Z_flat, Y_flat, X_flat) / cz_xy_um
-        cz_x_vox = rbf[2](Z_flat, Y_flat, X_flat) / cz_xy_um
-        coords = np.stack([cz_z_vox, cz_y_vox, cz_x_vox])
-        warped_cz[k] = map_coordinates(
-            cz_seg, coords, order=0, mode="constant", cval=0).reshape(ny, nx)
-        warped_img[k] = map_coordinates(
-            cz_vol, coords, order=1, mode="constant", cval=0.0).reshape(ny, nx)
-        if (k + 1) % max(1, nz // 10) == 0:
-            print(f"[build_qc]     z {k+1}/{nz} [{time.time()-t:.1f}s]", flush=True)
+    _WARP_CTX.update(dict(
+        rbf=rbf, Y_flat=Y_flat, X_flat=X_flat, z_lo=z_lo, vox=vox,
+        cz_z_um=cz_z_um, cz_xy_um=cz_xy_um, cz_seg=cz_seg, cz_vol=cz_vol,
+        ny=ny, nx=nx))
+    n_workers = int(os.environ.get(
+        "MFISH_QC_WARP_WORKERS", max(1, (os.cpu_count() or 2) - 2)))
+    n_workers = max(1, min(n_workers, nz))
+    if n_workers == 1:
+        k0, cz_b, img_b = _warp_zslice_chunk(range(nz))
+        warped_cz[:] = cz_b
+        warped_img[:] = img_b
+    else:
+        # Parallelize over z-slice chunks (each independent; cz_seg/cz_vol are
+        # fork-shared read-only — the Rbf evaluation is the cost, scales ~linearly).
+        chunk = max(1, nz // (n_workers * 3))
+        chunks = [range(i, min(i + chunk, nz)) for i in range(0, nz, chunk)]
+        print(f"[build_qc]   CZ warp: {nz} z @ {vox}µm, {len(chunks)} chunks, "
+              f"{n_workers} workers", flush=True)
+        done = 0
+        with mp.get_context("fork").Pool(n_workers) as pool:
+            for k0, cz_b, img_b in pool.imap_unordered(_warp_zslice_chunk, chunks):
+                warped_cz[k0:k0 + cz_b.shape[0]] = cz_b
+                warped_img[k0:k0 + img_b.shape[0]] = img_b
+                done += cz_b.shape[0]
+                print(f"[build_qc]     warped {done}/{nz} z [{time.time()-t:.1f}s]",
+                      flush=True)
+    _WARP_CTX.clear()
     print(f"[build_qc]   CZ warp done [{time.time()-t:.1f}s]", flush=True)
 
     # ----- split CZ warped seg into matched / unmatched -----
