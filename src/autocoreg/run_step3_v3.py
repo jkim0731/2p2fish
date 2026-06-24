@@ -63,7 +63,8 @@ from .run_step3_iterative import (
 )
 from .soma_print import cell_vectors
 
-OUT_BASE = Path("/tmp/autocoreg_outputs")
+# Matcher output root. Env-overridable; NEVER defaults to /tmp or / (storage rule).
+OUT_BASE = Path(os.environ.get("MFISH_MATCHER_OUT_BASE", "/scratch/autocoreg_outputs/matches"))
 
 # ── Constants (single source of truth per spec §8) ────────────────────────────
 

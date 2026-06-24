@@ -92,15 +92,16 @@ DATA_LEVEL = Path(os.environ.get("MFISH_DATA_LEVEL", str(_DATA_RO)))
 # Pre-built per-subject QC label volumes + warped-CZ image live under
 # <QC_ARTIFACT_DIR>/<variant>/<sid>/ (cz_matched_seg.tif, hcr_*_seg.tif,
 # seg_volumes_meta.json, cz_warped_in_hcr_um.tif, cz_warped_meta.json).
+# Defaults NEVER use /tmp or / (storage rule): scratch only, env-overridable.
 QC_ARTIFACT_DIR = Path(
-    os.environ.get("MFISH_QC_ARTIFACT_DIR", "/tmp/autocoreg_outputs/qc")
+    os.environ.get("MFISH_QC_ARTIFACT_DIR", "/scratch/autocoreg_outputs/qc")
 )
 # Per-CZ-ROI QC labels (auto-saved by the app, append-only CSV).
 QC_LABELS_DIR = Path(
-    os.environ.get("MFISH_QC_LABELS_DIR", "/tmp/autocoreg_outputs/qc_labels")
+    os.environ.get("MFISH_QC_LABELS_DIR", "/scratch/autocoreg_outputs/qc_labels")
 )
 # Matcher (run_step3_v3) output root.  find_final_round_csv() looks under
 # <QC_MATCHES_DIR>/step3_v2_path_a_<variant>/<sid>/matches_*round*.csv.
 QC_MATCHES_DIR = Path(
-    os.environ.get("MFISH_QC_MATCHES_DIR", "/tmp/autocoreg_outputs/matches")
+    os.environ.get("MFISH_QC_MATCHES_DIR", "/scratch/autocoreg_outputs/matches")
 )

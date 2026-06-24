@@ -91,9 +91,20 @@ COLOR_ADDED_LINK   = (0,   255, 0,   220)  # green   (session-added landmark lin
 def parse_args(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--sid", required=True)
-    p.add_argument("--variant", default="local_flow",
-                   choices=["local_flow", "lr_mb", "lr_only",
-                            "local_flow_wang_end", "lr_mb_wang_end", "lr_only_wang_end"])
+    # Free-text (not choices): must accept the production variant
+    # step3_v3_anchor_vote_wang_end as well as the legacy session variants.
+    p.add_argument("--variant", default="step3_v3_anchor_vote_wang_end",
+                   help="Matcher/QC variant dir name (e.g. step3_v3_anchor_vote_wang_end).")
+    p.add_argument("--final-pairs", dest="final_pairs", default=None,
+                   help="Path to final_pairs.csv (cz_id,hcr_id,soma_score). If omitted, "
+                        "the app looks in the artifact dir and computes+caches it if absent.")
+    p.add_argument("--sort", default="soma_desc",
+                   choices=["soma_desc", "soma_asc", "matcher"],
+                   help="QC queue order: soma_desc = least-confident first (default), "
+                        "soma_asc = most-confident first, matcher = matcher row order.")
+    p.add_argument("--worst-pct", dest="worst_pct", type=float, default=None,
+                   help="Restrict the queue to the worst (highest-soma-distance) N%% of "
+                        "matched pairs (matched-only). Omit for the full queue.")
     p.add_argument("--cube_um", type=float, default=CUBE_HALF_UM,
                    help="Cube half-extent in µm (default 60).")
     p.add_argument("--level", type=int, default=HCR_LEVEL,
@@ -248,7 +259,8 @@ class CubeView(QtWidgets.QWidget):
 class QCApp(QtWidgets.QMainWindow):
     def __init__(self, sid: str, variant: str, cube_um: float, start: int,
                  hcr_level: int = HCR_LEVEL, cz_list_path: str | None = None,
-                 matches_csv: str | None = None):
+                 matches_csv: str | None = None, final_pairs_path: str | None = None,
+                 sort_mode: str = "soma_desc", worst_pct: float | None = None):
         super().__init__()
         self.sid = sid
         self.variant = variant
@@ -256,10 +268,14 @@ class QCApp(QtWidgets.QMainWindow):
         self.hcr_level = int(hcr_level)
         self.cz_list_path = cz_list_path
         self.matches_csv = matches_csv
+        self.final_pairs_path = final_pairs_path
+        self.sort_mode = sort_mode          # soma_desc | soma_asc | matcher
+        self.worst_pct = worst_pct          # None = full queue
         self.setWindowTitle(f"QC Qt — {sid} / {variant}")
         self._load_data()
         self._init_state()
         self._build_ui()
+        self._update_queue_label()
         # initial show
         start = max(0, min(start, len(self.cz_order) - 1))
         self.show_idx = start
@@ -305,27 +321,26 @@ class QCApp(QtWidgets.QMainWindow):
         self.cz_to_hcr = dict(zip(
             self.df_matches["cz_id"], self.df_matches["hcr_id"]
         ))
-        self.cz_to_soma = dict(zip(
-            self.df_matches["cz_id"],
-            self.df_matches.get("soma_score", pd.Series([np.nan] * len(self.df_matches))),
-        ))
-        # cz_id iteration order: matched first by row order, then unmatched
-        cz_matched_ids = list(self.df_matches["cz_id"])
+        # Per-pair soma-print score (G2): the production Wang final CSV has no
+        # soma_score column, so load/compute final_pairs.csv (cz_id,hcr_id,soma_score)
+        # — soma is a DISTANCE, lower = better match.  cz_to_soma drives the queue sort.
+        self.cz_to_soma = self._load_soma_scores(qc_dir, matches_csv)
+        finite_soma = {c: s for c, s in self.cz_to_soma.items()
+                       if s is not None and np.isfinite(s)}
+        self.cz_to_somarank, self.cz_to_somapct = {}, {}
+        if finite_soma:
+            order_desc = sorted(finite_soma, key=lambda c: finite_soma[c], reverse=True)
+            n = len(order_desc)
+            for r, c in enumerate(order_desc):
+                self.cz_to_somarank[c] = r + 1                  # 1 = least confident
+                self.cz_to_somapct[c] = 1.0 - r / max(1, n - 1)  # ~1 = least confident
+
+        # Matched (have an hcr_id) + unmatched-only CZ ids; queue built from these.
+        self.cz_matched_ids = [int(c) for c in self.df_matches["cz_id"]]
         unmatched_uniq = sorted(set(int(v) for v in np.unique(self.cz_unmatched_arr) if v != 0))
-        # avoid double-counting
-        matched_set = set(cz_matched_ids)
-        unmatched_only = [v for v in unmatched_uniq if v not in matched_set]
-        full_order = list(cz_matched_ids) + unmatched_only
-        if self.cz_list_path:
-            ext = pd.read_csv(self.cz_list_path)
-            wanted = [int(c) for c in ext["cz_id"].astype(int).tolist()]
-            full_set = set(full_order)
-            self.cz_order = [c for c in wanted if c in full_set]
-            missing = [c for c in wanted if c not in full_set]
-            print(f"[qt] --cz_list restricts to {len(self.cz_order)}/{len(wanted)} CZ "
-                  f"IDs (skipped {len(missing)} not present in seg)")
-        else:
-            self.cz_order = full_order
+        matched_set = set(self.cz_matched_ids)
+        self.unmatched_only = [v for v in unmatched_uniq if v not in matched_set]
+        self._build_cz_order()
 
         # CZ centroids in HCR µm (warped grid → world)
         all_cz_uniq = sorted(set(int(v) for v in np.unique(self.cz_matched_arr) if v != 0) |
@@ -447,10 +462,89 @@ class QCApp(QtWidgets.QMainWindow):
                 for r in mm.itertuples(index=False)
             ]
 
-        print(f"[qt] {len(self.cz_order)} CZ ROIs ({len(cz_matched_ids)} matched, "
-              f"{len(unmatched_only)} unmatched).  "
+        print(f"[qt] {len(self.cz_order)} CZ ROIs in queue ({len(self.cz_matched_ids)} matched, "
+              f"{len(self.unmatched_only)} unmatched).  "
               f"HCR 488 cube {self.hcr488.shape}, "
               f"{len(self.labels_state)} prior labels.")
+
+    # ---------------- soma scores + review queue (G3) ----------------
+    def _load_soma_scores(self, qc_dir, matches_csv) -> dict:
+        """Resolve {cz_id: soma_score}.  Order: --final-pairs; else
+        <qc_dir>/final_pairs.csv; else compute via score_final_pairs and cache there.
+        Soma is a DISTANCE (lower = better).  Falls back to NaN (matcher-order queue)
+        if scoring is unavailable."""
+        fp = Path(self.final_pairs_path) if self.final_pairs_path else (qc_dir / "final_pairs.csv")
+        if not fp.exists():
+            try:
+                from .score_final_pairs import score_final_pairs
+                print(f"[qt] computing soma scores (no {fp.name}); one-time ~1 min ...",
+                      flush=True)
+                score_final_pairs(self.sid, matches_csv, out_csv=fp)
+            except Exception as e:
+                print(f"[qt] WARN: soma scoring unavailable ({e}); queue = matcher order")
+                return {int(c): float("nan") for c in self.df_matches["cz_id"]}
+        try:
+            d = pd.read_csv(fp)
+            soma = {int(c): float(s) for c, s in zip(d["cz_id"], d["soma_score"])}
+            n_fin = int(np.isfinite(np.fromiter(soma.values(), dtype=float)).sum())
+            print(f"[qt] soma scores: {fp} ({n_fin} finite / {len(soma)})")
+            return soma
+        except Exception as e:
+            print(f"[qt] WARN: could not read {fp} ({e}); queue = matcher order")
+            return {int(c): float("nan") for c in self.df_matches["cz_id"]}
+
+    def _soma_of(self, cz_id):
+        s = self.cz_to_soma.get(int(cz_id), float("nan"))
+        return s if (s is not None and np.isfinite(s)) else None
+
+    def _build_cz_order(self):
+        """Build self.cz_order from matched (soma-sorted) + unmatched, honouring
+        sort_mode (soma_desc=least-confident first), worst_pct, and optional --cz_list."""
+        matched = list(self.cz_matched_ids)
+        finite = [c for c in matched if self._soma_of(c) is not None]
+        nan_m = [c for c in matched if self._soma_of(c) is None]
+        if self.sort_mode == "soma_desc":
+            finite.sort(key=self._soma_of, reverse=True)
+            matched_sorted = finite + nan_m
+        elif self.sort_mode == "soma_asc":
+            finite.sort(key=self._soma_of)
+            matched_sorted = finite + nan_m
+        else:  # matcher row order
+            matched_sorted = matched
+        if self.worst_pct is not None and finite:
+            k = max(1, int(np.ceil(self.worst_pct / 100.0 * len(finite))))
+            worst = set(sorted(finite, key=self._soma_of, reverse=True)[:k])
+            order = [c for c in matched_sorted if c in worst]  # matched-only focus
+        else:
+            order = matched_sorted + list(self.unmatched_only)
+        if self.cz_list_path:
+            ext = pd.read_csv(self.cz_list_path)
+            wanted = [int(c) for c in ext["cz_id"].astype(int).tolist()]
+            avail = set(matched) | set(self.unmatched_only)
+            order = [c for c in wanted if c in avail]
+            print(f"[qt] --cz_list restricts to {len(order)}/{len(wanted)} present CZ ids")
+        self.cz_order = order
+        print(f"[qt] queue: {len(order)} ROIs (sort={self.sort_mode}"
+              + (f", worst {self.worst_pct:.0f}%" if self.worst_pct is not None else "")
+              + f"; {len(finite)} matched w/soma, {len(self.unmatched_only)} unmatched)")
+
+    def _rebuild_queue(self):
+        """Re-read the queue widgets, rebuild cz_order, stay on the current ROI if
+        still present (else reset to 0), refresh."""
+        idx = self.cmb_sort.currentIndex()
+        self.sort_mode = {0: "soma_desc", 1: "soma_asc", 2: "matcher"}[idx]
+        w = float(self.spin_worst.value())
+        self.worst_pct = w if w > 0 else None
+        cur = self.cz_order[self.show_idx] if self.cz_order else None
+        self._build_cz_order()
+        self._update_queue_label()
+        self.show_idx = self.cz_order.index(cur) if (cur in self.cz_order) else 0
+        if self.cz_order:
+            self._refresh_pair()
+
+    def _update_queue_label(self):
+        if hasattr(self, "lbl_queue"):
+            self.lbl_queue.setText(f"{len(self.cz_order)} ROIs in queue")
 
     def _init_state(self):
         self.show_idx = 0
@@ -773,6 +867,33 @@ class QCApp(QtWidgets.QMainWindow):
         self.lbl_status.setStyleSheet("font-weight: bold;")
         pl.addWidget(self.lbl_status)
 
+        # ---- Review queue controls (G3): soma-sorted, least-confident first ----
+        q_box = QtWidgets.QGroupBox("Review queue")
+        ql = QtWidgets.QVBoxLayout(); q_box.setLayout(ql)
+        ql.addWidget(QtWidgets.QLabel("Sort (soma distance: lower = better match):"))
+        self.cmb_sort = QtWidgets.QComboBox()
+        self.cmb_sort.addItems(["Least-confident first", "Most-confident first",
+                                "Matcher order"])
+        self.cmb_sort.setCurrentIndex(
+            {"soma_desc": 0, "soma_asc": 1, "matcher": 2}.get(self.sort_mode, 0))
+        self.cmb_sort.currentIndexChanged.connect(lambda _: self._rebuild_queue())
+        ql.addWidget(self.cmb_sort)
+        wrow = QtWidgets.QHBoxLayout()
+        wrow.addWidget(QtWidgets.QLabel("Worst %:"))
+        self.spin_worst = QtWidgets.QDoubleSpinBox()
+        self.spin_worst.setRange(0, 100); self.spin_worst.setDecimals(0)
+        self.spin_worst.setSingleStep(5)
+        self.spin_worst.setValue(self.worst_pct if self.worst_pct is not None else 0)
+        self.spin_worst.setToolTip("0 = full queue; N = only the worst N% matched pairs")
+        btn_worst = QtWidgets.QPushButton("Apply")
+        btn_worst.clicked.connect(self._rebuild_queue)
+        wrow.addWidget(self.spin_worst); wrow.addWidget(btn_worst)
+        ql.addLayout(wrow)
+        self.lbl_queue = QtWidgets.QLabel("")
+        self.lbl_queue.setWordWrap(True)
+        ql.addWidget(self.lbl_queue)
+        pl.addWidget(q_box)
+
         # Z slider
         z_lbl_row = QtWidgets.QHBoxLayout()
         z_lbl_row.addWidget(QtWidgets.QLabel("Z (µm):"))
@@ -1055,11 +1176,18 @@ class QCApp(QtWidgets.QMainWindow):
         self._build_radio(matched)
 
         # Status label
-        status = (
-            f"CZ ROI {self.show_idx + 1}/{len(self.cz_order)}  "
-            f"cz_id={cz_id}  "
-            f"{'matched → hcr_id=' + str(hcr_id) + f'  soma={soma:.2f}' if matched else 'UNMATCHED'}"
-        )
+        if matched:
+            rk = self.cz_to_somarank.get(cz_id)
+            pct = self.cz_to_somapct.get(cz_id)
+            soma_str = f"soma={soma:.2f}µm" if np.isfinite(soma) else "soma=NA"
+            if rk is not None:
+                soma_str += (f"  (least-conf rank {rk}/{len(self.cz_to_somarank)}, "
+                             f"pct {pct:.2f})")
+            pair_str = f"matched → hcr_id={hcr_id}  {soma_str}"
+        else:
+            pair_str = "UNMATCHED"
+        status = (f"CZ ROI {self.show_idx + 1}/{len(self.cz_order)}  "
+                  f"cz_id={cz_id}  {pair_str}")
         cur_label = self.labels_state.get(cz_id, "—")
         status += f"\nlabel: <b>{cur_label}</b>"
         self.lbl_status.setText(status)
@@ -1448,14 +1576,18 @@ class QCApp(QtWidgets.QMainWindow):
         print(f"[label] idx={self.show_idx+1} cz_id={cz_id} {'matched' if self.cur_matched else 'unmatched'} → {label}")
 
 
-def launch(sid: str, variant: str = "local_flow", cube_um: float = CUBE_HALF_UM,
-           start: int = 0, hcr_level: int = HCR_LEVEL,
-           cz_list_path: str | None = None, matches_csv: str | None = None):
+def launch(sid: str, variant: str = "step3_v3_anchor_vote_wang_end",
+           cube_um: float = CUBE_HALF_UM, start: int = 0, hcr_level: int = HCR_LEVEL,
+           cz_list_path: str | None = None, matches_csv: str | None = None,
+           final_pairs_path: str | None = None, sort_mode: str = "soma_desc",
+           worst_pct: float | None = None):
     """Build the QC window and return (QApplication, QCApp) without entering the
     event loop.  Callers that want a blocking GUI call ``app.exec_()`` after."""
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
     win = QCApp(sid, variant, cube_um, start, hcr_level,
-                cz_list_path=cz_list_path, matches_csv=matches_csv)
+                cz_list_path=cz_list_path, matches_csv=matches_csv,
+                final_pairs_path=final_pairs_path, sort_mode=sort_mode,
+                worst_pct=worst_pct)
     win.show()
     return app, win
 
@@ -1464,7 +1596,9 @@ def main(argv=None):
     args = parse_args(argv)
     app, _win = launch(args.sid, args.variant, args.cube_um, args.start,
                        args.level, cz_list_path=args.cz_list,
-                       matches_csv=args.matches_csv)
+                       matches_csv=args.matches_csv,
+                       final_pairs_path=args.final_pairs, sort_mode=args.sort,
+                       worst_pct=args.worst_pct)
     sys.exit(app.exec_())
 
 

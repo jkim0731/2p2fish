@@ -127,6 +127,16 @@ def _find_coreg_dir(subject_id: str) -> Path:
 
 def _find_hcr_dir(subject_id: str) -> Path:
     matches = sorted(DATA_DIR.glob(f"HCR_{subject_id}_*_processed_*"))
+    # Exclude downstream-derived assets whose names embed the processed-asset name
+    # and thus also match this glob — e.g. the Capsule-1 ROI-quality output asset
+    # "HCR_<sid>_..._processed_..._HCR-ROI-label_<date>", which holds only the proba
+    # parquet and would otherwise shadow the real processed data dir.
+    matches = [m for m in matches if "_HCR-ROI-label_" not in m.name]
+    # Prefer a candidate that actually holds the HCR data (cell_body_segmentation),
+    # robust against any other sibling asset whose name happens to collide.
+    data_dirs = [m for m in matches if (m / "cell_body_segmentation").exists()]
+    if data_dirs:
+        matches = data_dirs
     if not matches:
         raise FileNotFoundError(f"No HCR processed dir for {subject_id}")
     return matches[-1]

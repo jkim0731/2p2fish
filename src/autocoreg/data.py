@@ -86,9 +86,29 @@ def strict_gfp_ids(sid: str) -> tuple[set[int], dict]:
 # --------------------------------------------------------------------------- #
 # ROI quality argmax-ok (per user feedback)
 # --------------------------------------------------------------------------- #
-def argmax_ok_ids(sid: str) -> set[int]:
+def _resolve_roi_quality_parquet(sid: str) -> Path:
+    """Locate ``{sid}_roi_quality_proba.parquet``.
+
+    Prefer ``MFISH_ROI_QUALITY_DIR`` (the cross-repo contract dir); else fall back to
+    the attached Capsule-1 inference asset under ``DATA_ROOT``
+    (``HCR_<sid>_..._HCR-ROI-label_<date>/{sid}_roi_quality_proba.parquet``), so a
+    freshly-attached asset works with no manual symlinking.
+    """
     p = _config.ROI_QUALITY_DIR / f"{sid}_roi_quality_proba.parquet"
-    df = pd.read_parquet(p)
+    if p.exists():
+        return p
+    cands = sorted(_config.DATA_ROOT.glob(
+        f"HCR_{sid}_*_HCR-ROI-label_*/{sid}_roi_quality_proba.parquet"))
+    if cands:
+        return cands[-1]
+    raise FileNotFoundError(
+        f"No ROI-quality proba parquet for {sid}: looked in {p} and "
+        f"{_config.DATA_ROOT}/HCR_{sid}_*_HCR-ROI-label_*/{sid}_roi_quality_proba.parquet"
+    )
+
+
+def argmax_ok_ids(sid: str) -> set[int]:
+    df = pd.read_parquet(_resolve_roi_quality_parquet(sid))
     cls = ["p_bad", "p_bad_ok", "p_good", "p_merged"]
     am = df[cls].idxmax(axis=1)
     return set(df.loc[am.isin(["p_good", "p_bad_ok"]), "hcr_id"].astype(int).tolist())

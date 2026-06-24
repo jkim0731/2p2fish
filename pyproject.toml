@@ -27,6 +27,7 @@ qc = [
 
 [project.scripts]
 autocoreg = "autocoreg.cli:main"
+autocoreg_qc = "autocoreg.qc.launcher:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
