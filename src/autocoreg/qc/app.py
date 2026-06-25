@@ -28,13 +28,18 @@ Keys:
   ↑ / ↓  Z slice ±1 (slice mode only)
   Shift+wheel  Z slice ±1 (slice mode; plain wheel = zoom)
   s / m  switch to slice / MIP-cube-Z mode
-  1 / 2 / 3   select radio option (top to bottom)
-  4          toggle HCR 488 image
+  1 / 2 / 3   matched pair label: good / bad / unsure
+  4 / 5       unmatched ROI label: matched-roi visible / not-visible
+  q          toggle HCR 488 image
   w          toggle CZ warped image
   c          toggle "other CZ ROIs"
-  h          toggle "other HCR ROIs"
-  a          toggle add-match mode
+  v          toggle "other HCR ROIs"
+  b / n      toggle HCR failed-GFP+ / failed-classifier overlays
+  u          toggle add-match mode
+  i          toggle batch-accept (MIP: left-click a CZ/HCR overlap to accept/remove)
   Enter      next ROI if labeled (QC mode) / add pending pair (add-match mode)
+  Shift+right-click   report CZ + HCR ROI IDs overlapping the point
+  right-click         context menu (incl. "Show IDs" for the same)
   Backspace  undo last added pair (add-match mode)
   Esc        reset the pending selection (add-match mode)
 
@@ -47,6 +52,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -294,10 +300,13 @@ class QCApp(QtWidgets.QMainWindow):
         self._init_state()
         self._build_ui()
         self._update_queue_label()
+        self._refresh_qcd_list()
         # initial show
         start = max(0, min(start, len(self.cz_order) - 1))
         self.show_idx = start
         self._refresh_pair()
+        # Once shown + laid out, widen the window so the image area is square.
+        QtCore.QTimer.singleShot(0, self._square_image)
 
     # ---------------- data loading ----------------
     def _load_data(self):
@@ -317,6 +326,17 @@ class QCApp(QtWidgets.QMainWindow):
         self.cz_unmatched_arr = tifffile.imread(str(qc_dir / "cz_unmatched_seg.tif"))
         self.hcr_matched_arr   = tifffile.imread(str(qc_dir / "hcr_matched_seg.tif"))
         self.hcr_unmatched_arr = tifffile.imread(str(qc_dir / "hcr_unmatched_seg.tif"))
+        # Per matched-HCR-ROI z-extent (world µm) for MIP marker gating: a QC'd pair's
+        # marker shows in MIP only if its HCR ROI overlaps the MIP slab thickness.
+        from scipy.ndimage import find_objects
+        self.hcr_zrange: dict[int, tuple[float, float]] = {}
+        for k, sl in enumerate(find_objects(self.hcr_matched_arr)):
+            if sl is None:
+                continue
+            self.hcr_zrange[k + 1] = (
+                self.hbb["z_lo"] + sl[0].start * self.hcr_vox_z,
+                self.hbb["z_lo"] + sl[0].stop * self.hcr_vox_z,
+            )
         # Optional: HCR cells that failed each filter (NOT in pool).
         fg_path = qc_dir / "hcr_failed_gfp_seg.tif"
         fc_path = qc_dir / "hcr_failed_classifier_seg.tif"
@@ -472,6 +492,7 @@ class QCApp(QtWidgets.QMainWindow):
             )
             self.labels_state = {
                 int(r.cz_id): str(r.label) for r in prior.itertuples(index=False)
+                if str(r.label) not in ("removed", "", "nan")
             }
         else:
             self.labels_state = {}
@@ -584,6 +605,9 @@ class QCApp(QtWidgets.QMainWindow):
         self.show_hcr488 = True
         self.show_hcr_fail_gfp = False
         self.show_hcr_fail_cls = False
+        self.show_qc_markers = True   # spatial dots for QC'd pairs (good/bad/unsure)
+        self.batch_accept_mode = False  # MIP left-click accept (function 3)
+        self._id_text_item = None     # ephemeral on-image ROI-ID text (right-click)
         self.mip_mode = False  # toggled by 'm' / radio
 
         # ---- Add-match mode (function 2) ----
@@ -695,17 +719,23 @@ class QCApp(QtWidgets.QMainWindow):
         return 0
 
     def _on_canvas_click(self, ev):
-        """Left-click in add-match mode: first click picks the CZ ROI (nearest
-        warped CZ centroid), second picks the HCR ROI (label under cursor, else
-        nearest HCR centroid)."""
-        if not self.add_match_mode:
-            return
+        """Left-click drives add-match / batch-accept modes.  Right-click ROI-ID
+        inspection is handled in eventFilter (Shift) + the right-click menu."""
         if ev.button() != QtCore.Qt.LeftButton:
             return
-        vb = self.view.plot.getViewBox()
+        if not (self.add_match_mode or self.batch_accept_mode):
+            return
         if not self.view.plot.sceneBoundingRect().contains(ev.scenePos()):
             return
+        vb = self.view.plot.getViewBox()
         pt = vb.mapSceneToView(ev.scenePos())
+        # Batch-accept (MIP): click a CZ/HCR overlap to accept the pair.
+        if self.batch_accept_mode:
+            if not self.mip_mode:
+                self._notify("Batch-accept: switch to MIP mode (m) first")
+                return
+            self._batch_click(float(pt.x()), float(pt.y()))
+            return
         x, y, z = float(pt.x()), float(pt.y()), self.cur_z_world
         z_tol = max(self.cube_half, 8.0)
         if self.pending_cz_id is None:
@@ -810,10 +840,9 @@ class QCApp(QtWidgets.QMainWindow):
               f"n_active={len(self.active_pairs)}")
 
     def _draw_match_overlay(self):
-        """Overlay for add-match mode: warped CZ centroid markers (gold) visible
-        in the current slice, plus highlights + a link line for the pending
-        selection.  Cleared (and skipped) when add-match mode is off."""
+        """Overlay: QC'd-pair markers (always) + add-match markers (add-match mode)."""
         self.view.clear_overlay()
+        self._draw_qc_markers()
         if not self.add_match_mode:
             return
         (vy_lo, vy_hi), (vx_lo, vx_hi) = self._viewport_xy_range()
@@ -852,6 +881,8 @@ class QCApp(QtWidgets.QMainWindow):
 
     def _toggle_add_match(self):
         self.add_match_mode = self.chk_add_match.isChecked()
+        if self.add_match_mode and self.chk_batch.isChecked():
+            self.chk_batch.setChecked(False)  # mutually exclusive click modes
         self.match_box.setVisible(self.add_match_mode)
         # Disable the pass/fail radio while matching (avoid stray labels).
         self.radio_box.setEnabled(not self.add_match_mode)
@@ -898,6 +929,7 @@ class QCApp(QtWidgets.QMainWindow):
 
         self.lbl_status = QtWidgets.QLabel("…")
         self.lbl_status.setStyleSheet("font-weight: bold;")
+        self.lbl_status.setWordWrap(True)   # wrap instead of clipping on the right
         pl.addWidget(self.lbl_status)
 
         # ---- Review queue controls (G3): soma-sorted, least-confident first ----
@@ -954,7 +986,7 @@ class QCApp(QtWidgets.QMainWindow):
             )
 
         # Toggles
-        self.chk_hcr488 = QtWidgets.QCheckBox("HCR 488 image (4)")
+        self.chk_hcr488 = QtWidgets.QCheckBox("HCR 488 image (q)")
         self.chk_hcr488.setChecked(True)
         self.chk_hcr488.stateChanged.connect(lambda _: self._toggle_hcr488())
         pl.addWidget(self.chk_hcr488)
@@ -987,18 +1019,24 @@ class QCApp(QtWidgets.QMainWindow):
         self.chk_other_cz.setChecked(True)
         self.chk_other_cz.stateChanged.connect(lambda _: self._toggle_other_cz())
         pl.addWidget(self.chk_other_cz)
-        self.chk_other_hcr = QtWidgets.QCheckBox("Other HCR ROIs (h)")
+        self.chk_other_hcr = QtWidgets.QCheckBox("Other HCR ROIs (v)")
         self.chk_other_hcr.setChecked(True)
         self.chk_other_hcr.stateChanged.connect(lambda _: self._toggle_other_hcr())
         pl.addWidget(self.chk_other_hcr)
-        self.chk_hcr_fail_gfp = QtWidgets.QCheckBox("HCR failed GFP+ (f)")
+        self.chk_hcr_fail_gfp = QtWidgets.QCheckBox("HCR failed GFP+ (b)")
         self.chk_hcr_fail_gfp.setChecked(False)
         self.chk_hcr_fail_gfp.stateChanged.connect(lambda _: self._toggle_hcr_fail_gfp())
         pl.addWidget(self.chk_hcr_fail_gfp)
-        self.chk_hcr_fail_cls = QtWidgets.QCheckBox("HCR failed ROI classifier (r)")
+        self.chk_hcr_fail_cls = QtWidgets.QCheckBox("HCR failed ROI classifier (n)")
         self.chk_hcr_fail_cls.setChecked(False)
         self.chk_hcr_fail_cls.stateChanged.connect(lambda _: self._toggle_hcr_fail_cls())
         pl.addWidget(self.chk_hcr_fail_cls)
+        self.chk_qc_markers = QtWidgets.QCheckBox("QC'd markers")
+        self.chk_qc_markers.setToolTip("Spatial dots for QC'd pairs: good=green, "
+                                       "bad=red, unsure=yellow")
+        self.chk_qc_markers.setChecked(True)
+        self.chk_qc_markers.stateChanged.connect(lambda _: self._toggle_qc_markers())
+        pl.addWidget(self.chk_qc_markers)
 
         # Radio group — built lazily per-pair (different options for matched/unmatched)
         self.radio_box = QtWidgets.QGroupBox("Label (auto-save)")
@@ -1009,10 +1047,16 @@ class QCApp(QtWidgets.QMainWindow):
         pl.addWidget(self.radio_box)
 
         # ---- Add-match mode (function 2) ----
-        self.chk_add_match = QtWidgets.QCheckBox("Add-match mode (a)")
+        self.chk_add_match = QtWidgets.QCheckBox("Add-match mode (u)")
         self.chk_add_match.setChecked(False)
         self.chk_add_match.stateChanged.connect(lambda _: self._toggle_add_match())
         pl.addWidget(self.chk_add_match)
+        self.chk_batch = QtWidgets.QCheckBox("Batch-accept MIP (i)")
+        self.chk_batch.setToolTip("MIP mode: left-click a CZ/HCR overlap to accept "
+                                  "(label good); click again to remove.")
+        self.chk_batch.setChecked(False)
+        self.chk_batch.stateChanged.connect(lambda _: self._toggle_batch_accept())
+        pl.addWidget(self.chk_batch)
 
         self.match_box = QtWidgets.QGroupBox("Manual match (TPS re-warp)")
         mbl = QtWidgets.QVBoxLayout()
@@ -1061,41 +1105,83 @@ class QCApp(QtWidgets.QMainWindow):
         nav_row.addWidget(b_next)
         pl.addLayout(nav_row)
 
-        # Labels file path display
         pl.addStretch(1)
-        path_lbl = QtWidgets.QLabel(
-            f"<small>Labels: {self.labels_path}</small>"
-        )
-        path_lbl.setWordWrap(True)
-        pl.addWidget(path_lbl)
+
+        # ---- Far-right column: QC'd pairs (scrollable) + last action + save target ----
+        qcd_panel = QtWidgets.QWidget()
+        qcd_panel.setMaximumWidth(270)
+        qcd_panel.setMinimumWidth(210)
+        qv = QtWidgets.QVBoxLayout()
+        qv.setContentsMargins(4, 4, 4, 4); qv.setSpacing(4)
+        qcd_panel.setLayout(qv)
+        # last-action notification (coloured: green=accepted, orange=removed, red=rejected)
+        self.lbl_action = QtWidgets.QLabel("")
+        self.lbl_action.setWordWrap(True)
+        self.lbl_action.setStyleSheet("font-weight: bold;")
+        qv.addWidget(self.lbl_action)
+        self.qcd_box = QtWidgets.QGroupBox("QC'd pairs (0)")
+        ql2 = QtWidgets.QVBoxLayout(); self.qcd_box.setLayout(ql2)
+        self.qcd_list = QtWidgets.QListWidget()
+        self._qcd_items = {}  # cz_id -> QListWidgetItem (incremental updates)
+        self.qcd_list.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        self.qcd_list.setToolTip("Double-click to jump to a pair")
+        self.qcd_list.itemDoubleClicked.connect(self._on_qcd_double)
+        ql2.addWidget(self.qcd_list, stretch=1)
+        b_sort = QtWidgets.QPushButton("Sort")
+        b_sort.setToolTip("Sort the list by label then cz_id (else newest-last order)")
+        b_sort.clicked.connect(self._sort_qcd_list)
+        ql2.addWidget(b_sort)
+        b_rm = QtWidgets.QPushButton("Remove selected")
+        b_rm.clicked.connect(self._remove_selected_qcd)
+        ql2.addWidget(b_rm)
+        qv.addWidget(self.qcd_box, stretch=1)
+        # save target: show path + let the user choose folder/filename
+        self.lbl_savepath = QtWidgets.QLabel("")
+        self.lbl_savepath.setWordWrap(True)
+        self.lbl_savepath.setStyleSheet("color: #555;")
+        qv.addWidget(self.lbl_savepath)
+        b_save = QtWidgets.QPushButton("Set save file…")
+        b_save.clicked.connect(self._choose_save_file)
+        qv.addWidget(b_save)
+        h.addWidget(qcd_panel, stretch=0)
+        self._update_savepath_label()
 
         # Keyboard shortcuts
         self._mk_shortcut("Right", self._next)
         self._mk_shortcut("Left", self._prev)
         self._mk_shortcut("Up", self._z_up)
         self._mk_shortcut("Down", self._z_down)
-        self._mk_shortcut("1", lambda: self._click_radio(0))
-        self._mk_shortcut("2", lambda: self._click_radio(1))
-        self._mk_shortcut("3", lambda: self._click_radio(2))
+        # Radio labels: matched 1/2/3 (good/bad/unsure); unmatched 4/5 (visible/not).
+        self._mk_shortcut("1", lambda: self._radio_key(1))
+        self._mk_shortcut("2", lambda: self._radio_key(2))
+        self._mk_shortcut("3", lambda: self._radio_key(3))
+        # 5 selects "not visible" on unmatched ROIs (no-op otherwise).
+        self._mk_shortcut("5", lambda: self._radio_key(5))
         self._mk_shortcut("c", lambda: self.chk_other_cz.toggle())
-        self._mk_shortcut("h", lambda: self.chk_other_hcr.toggle())
+        self._mk_shortcut("v", lambda: self.chk_other_hcr.toggle())
         self._mk_shortcut("z", lambda: self.chk_cur_cz.toggle())
         self._mk_shortcut("x", lambda: self.chk_cur_hcr.toggle())
         self._mk_shortcut("p", self._copy_positions)
-        self._mk_shortcut("4", lambda: self.chk_hcr488.toggle())  # 4 → 488 image
+        # 4 selects "visible" on unmatched ROIs (no-op on matched).
+        self._mk_shortcut("4", lambda: self._radio_key(4))
+        self._mk_shortcut("q", lambda: self.chk_hcr488.toggle())  # q → 488 image
         self._mk_shortcut("w", lambda: self.chk_czw.toggle())     # w → warped CZ image
         self._mk_shortcut("m", lambda: self.rad_mip.setChecked(True))
         self._mk_shortcut("s", lambda: self.rad_slice.setChecked(True))
-        self._mk_shortcut("f", lambda: self.chk_hcr_fail_gfp.toggle())
-        self._mk_shortcut("r", lambda: self.chk_hcr_fail_cls.toggle())
-        self._mk_shortcut("a", lambda: self.chk_add_match.toggle())
+        self._mk_shortcut("b", lambda: self.chk_hcr_fail_gfp.toggle())
+        self._mk_shortcut("n", lambda: self.chk_hcr_fail_cls.toggle())
+        self._mk_shortcut("u", lambda: self.chk_add_match.toggle())
+        self._mk_shortcut("i", lambda: self.chk_batch.toggle())
         self._mk_shortcut("Return", self._enter_pressed)
         self._mk_shortcut("Enter", self._enter_pressed)
         self._mk_shortcut("Backspace", self._undo_pair)
         self._mk_shortcut("Escape", self._reset_selection)
 
-        # Mouse picking for add-match mode.
+        # Mouse picking for add-match mode (left-click).
         self.view.plot.scene().sigMouseClicked.connect(self._on_canvas_click)
+        # Keep pyqtgraph's right-click menu; add a "Show IDs" action to it.
+        self._last_rc_world = None
+        self.view.plot.getViewBox().menu.addAction("Show IDs", self._show_ids_from_menu)
         # Shift + mouse-wheel over the image steps the Z slice (plain wheel = zoom).
         self.view.plot.viewport().installEventFilter(self)
 
@@ -1109,6 +1195,22 @@ class QCApp(QtWidgets.QMainWindow):
         vb.sigRangeChanged.connect(lambda *a, **k: self._range_timer.start())
 
         self.resize(1100, 800)
+
+    def _square_image(self):
+        """Widen the window so the image area (CubeView) is ~square.  The two side
+        panels are fixed-width, so adding (height - width) of the view to the window
+        width makes the view square; clamped to the available screen width."""
+        vw, vh = self.view.width(), self.view.height()
+        if vw <= 0 or vh <= 0:
+            return
+        delta = vh - vw
+        if abs(delta) < 4:
+            return
+        new_w = self.width() + delta
+        screen = QtWidgets.QApplication.primaryScreen()
+        if screen is not None:
+            new_w = min(new_w, int(screen.availableGeometry().width() * 0.98))
+        self.resize(max(900, new_w), self.height())
 
     def _redraw_contours_only(self):
         """Refresh contours for the current viewport without touching images."""
@@ -1253,7 +1355,9 @@ class QCApp(QtWidgets.QMainWindow):
         status = (f"CZ ROI {self.show_idx + 1}/{len(self.cz_order)}  "
                   f"cz_id={cz_id}  {pair_str}")
         cur_label = self.labels_state.get(cz_id, "—")
-        status += f"\nlabel: <b>{cur_label}</b>"
+        n_left = sum(1 for c in self.cz_order if c not in self.labels_state)
+        status += (f"\nlabel: {cur_label}   |   "
+                   f"{len(self.labels_state)} QC'd, {n_left} left")
         self.lbl_status.setText(status)
 
     def _build_radio(self, matched: bool):
@@ -1265,14 +1369,16 @@ class QCApp(QtWidgets.QMainWindow):
         self.radio_buttons.clear()
 
         if matched:
-            options = ["good", "bad", "unsure"]
+            options = ["good", "bad", "unsure"]; keys = [1, 2, 3]
         else:
-            options = ["matched roi visible", "matched roi not visible"]
+            options = ["matched roi visible", "matched roi not visible"]; keys = [4, 5]
+        # key digit -> option index, used by the number-key shortcuts.
+        self._radio_key_for = {k: i for i, k in enumerate(keys)}
 
         cz_id = self.cur_cz_id
         prior = self.labels_state.get(cz_id, None)
         for i, opt in enumerate(options):
-            rb = QtWidgets.QRadioButton(f"{i+1}. {opt}")
+            rb = QtWidgets.QRadioButton(f"{keys[i]}. {opt}")
             if prior == opt:
                 rb.setChecked(True)
             rb.toggled.connect(lambda checked, o=opt: checked and self._save_label(o))
@@ -1348,10 +1454,19 @@ class QCApp(QtWidgets.QMainWindow):
         self.z_slider.setValue(max(self.z_slider.value() - 1, 0))
 
     def eventFilter(self, obj, ev):
-        """Shift+wheel over the image = step Z (slice mode); consume so it doesn't
-        also zoom.  Plain wheel falls through to pyqtgraph's zoom."""
-        if (ev.type() == QtCore.QEvent.Wheel
-                and (ev.modifiers() & QtCore.Qt.ShiftModifier)):
+        """Shift+wheel = step Z (consume so it doesn't also zoom).  Right-click:
+        record the position (for the menu's 'Show IDs'); Shift+right-click shows the
+        ROI IDs immediately and is consumed (so the context menu doesn't pop)."""
+        t = ev.type()
+        if t == QtCore.QEvent.MouseButtonPress and ev.button() == QtCore.Qt.RightButton:
+            sp = self.view.plot.mapToScene(ev.pos())
+            wp = self.view.plot.getViewBox().mapSceneToView(sp)
+            self._last_rc_world = (float(wp.x()), float(wp.y()))
+            if ev.modifiers() & QtCore.Qt.ShiftModifier:
+                self._show_roi_ids_at(*self._last_rc_world)
+                return True  # consume -> no context menu
+            # plain right-click falls through -> pyqtgraph menu (with "Show IDs")
+        elif t == QtCore.QEvent.Wheel and (ev.modifiers() & QtCore.Qt.ShiftModifier):
             if not self.mip_mode:
                 dy = ev.angleDelta().y()
                 if dy > 0:
@@ -1361,7 +1476,12 @@ class QCApp(QtWidgets.QMainWindow):
             return True  # consume (no zoom) whenever Shift is held
         return super().eventFilter(obj, ev)
 
+    def _show_ids_from_menu(self):
+        if getattr(self, "_last_rc_world", None) is not None:
+            self._show_roi_ids_at(*self._last_rc_world)
+
     def _redraw(self):
+        self._clear_id_text()  # ROI-ID text is ephemeral: drop it when the image changes
         bb = self.cube_bb
         z_world = self.cur_z_world
         # ----- HCR 488 -----
@@ -1610,13 +1730,25 @@ class QCApp(QtWidgets.QMainWindow):
                     self.view.add_contour(x, y, color=color, width=width)
 
     # ---------------- nav + toggles + label ----------------
+    def _step_to_unqcd(self, direction: int):
+        """Move to the nearest NOT-yet-QC'd pair in ``direction`` (+1 next, -1 prev).
+        Both arrows traverse the dynamic (un-QC'd) queue symmetrically, so →then← (or
+        ←then→) returns you to the same un-QC'd cell.  Revisit a QC'd pair by
+        double-clicking it in the QC'd list."""
+        n = len(self.cz_order)
+        for step in range(1, n + 1):
+            idx = (self.show_idx + direction * step) % n
+            if self.cz_order[idx] not in self.labels_state:
+                self.show_idx = idx
+                self._refresh_pair()
+                return
+        self._notify("All pairs in the queue are QC'd ✓", kind="ok")
+
     def _next(self):
-        self.show_idx = (self.show_idx + 1) % len(self.cz_order)
-        self._refresh_pair()
+        self._step_to_unqcd(+1)
 
     def _prev(self):
-        self.show_idx = (self.show_idx - 1) % len(self.cz_order)
-        self._refresh_pair()
+        self._step_to_unqcd(-1)
 
     def _enter_pressed(self):
         """Enter = add pair (add-match mode), else advance only if the current ROI
@@ -1633,9 +1765,46 @@ class QCApp(QtWidgets.QMainWindow):
             kind = "good/bad/unsure" if self.cur_matched else "visible/not-visible"
             self._notify(f"Not labeled — pick {kind} before Enter (use → to skip).")
 
-    def _notify(self, msg, ms=3000):
+    def _notify(self, msg, ms=3000, kind="info"):
+        """Status-bar message + a persistent coloured label in the QC'd panel."""
         self.statusBar().showMessage(msg, ms)
+        if hasattr(self, "lbl_action"):
+            col = {"ok": "#1a8a1a", "warn": "#c87000", "err": "#c00000",
+                   "info": "#333333"}.get(kind, "#333333")
+            self.lbl_action.setText(msg)
+            self.lbl_action.setStyleSheet(f"font-weight: bold; color: {col};")
         print("[notify]", msg)
+
+    def _update_savepath_label(self):
+        if hasattr(self, "lbl_savepath"):
+            self.lbl_savepath.setText(f"Saving QC labels to:\n{self.labels_path}")
+
+    def _dump_labels_to(self, path):
+        """Write the current QC state as a fresh labels CSV (snapshot)."""
+        ts = _dt.datetime.now().isoformat(timespec="seconds")
+        with open(path, "w") as f:
+            f.write("timestamp,idx,cz_id,hcr_id,soma_score,kind,label\n")
+            for cz, lab in self.labels_state.items():
+                hcr = self.cz_to_hcr.get(int(cz))
+                kind = "matched" if hcr is not None else "unmatched"
+                soma = float(self.cz_to_soma.get(int(cz), float("nan")))
+                f.write(f"{ts},-1,{int(cz)},{int(hcr) if hcr is not None else -1},"
+                        f"{soma:.4f},{kind},{lab}\n")
+
+    def _choose_save_file(self):
+        """Let the user pick the folder + filename for the QC labels CSV; snapshot
+        the current QC state there and direct future writes to it."""
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Choose QC labels CSV", str(self.labels_path),
+            "CSV files (*.csv);;All files (*)")
+        if not path:
+            return
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.labels_path = path
+        self._dump_labels_to(path)
+        self._update_savepath_label()
+        self._notify(f"Saving QC labels to {path.name}", kind="info")
 
     def _toggle_cur_cz(self):
         self.show_cur_cz = self.chk_cur_cz.isChecked()
@@ -1669,6 +1838,10 @@ class QCApp(QtWidgets.QMainWindow):
         self.show_hcr_fail_cls = self.chk_hcr_fail_cls.isChecked()
         self._redraw_contours_only()
 
+    def _toggle_qc_markers(self):
+        self.show_qc_markers = self.chk_qc_markers.isChecked()
+        self._draw_match_overlay()
+
     def _set_mode(self, mip: bool):
         self.mip_mode = bool(mip)
         # Z slider only meaningful in slice mode; gray out in MIP mode
@@ -1679,22 +1852,280 @@ class QCApp(QtWidgets.QMainWindow):
         if 0 <= i < len(self.radio_buttons):
             self.radio_buttons[i].setChecked(True)
 
-    def _save_label(self, label: str):
-        cz_id = self.cur_cz_id
-        hcr_id = self.cur_hcr_id if self.cur_matched else -1
+    def _radio_key(self, digit: int) -> bool:
+        """Select the radio option bound to a number key for the current pair
+        (matched: 1/2/3; unmatched: 4/5).  Returns True if it matched an option."""
+        idx = getattr(self, "_radio_key_for", {}).get(digit)
+        if idx is not None and idx < len(self.radio_buttons):
+            self._click_radio(idx)
+            return True
+        return False
+
+    # ---------------- label write (any pair) + QC'd list + markers ----------------
+    def _write_label(self, cz_id, hcr_id, soma, kind, label):
+        """Append a label row (append-only) for ANY cz_id and update in-memory state +
+        the QC'd-pairs list.  label='removed' un-QCs the pair (dropped on reload)."""
+        LABELS_ROOT.mkdir(parents=True, exist_ok=True)
         ts = _dt.datetime.now().isoformat(timespec="seconds")
-        soma = self.cur_soma if self.cur_matched else float("nan")
-        row = f"{ts},{self.show_idx},{cz_id},{hcr_id},{soma:.4f},{'matched' if self.cur_matched else 'unmatched'},{label}\n"
         write_header = not self.labels_path.exists()
         with open(self.labels_path, "a") as f:
             if write_header:
                 f.write("timestamp,idx,cz_id,hcr_id,soma_score,kind,label\n")
-            f.write(row)
-        self.labels_state[cz_id] = label
-        # Update status label
+            f.write(f"{ts},{self.show_idx},{int(cz_id)},{int(hcr_id)},"
+                    f"{soma:.4f},{kind},{label}\n")
+        self.labels_state[int(cz_id)] = label
+        self._qcd_upsert(int(cz_id), label)
+
+    def _save_label(self, label: str):
+        kind = "matched" if self.cur_matched else "unmatched"
+        soma = self.cur_soma if self.cur_matched else float("nan")
+        hcr_id = self.cur_hcr_id if self.cur_matched else -1
+        self._write_label(self.cur_cz_id, hcr_id, soma, kind, label)
         s = self.lbl_status.text().split("\n")[0]
-        self.lbl_status.setText(s + f"\nlabel: <b>{label}</b>  (saved)")
-        print(f"[label] idx={self.show_idx+1} cz_id={cz_id} {'matched' if self.cur_matched else 'unmatched'} → {label}")
+        self.lbl_status.setText(s + f"\nlabel: {label}  (saved)")
+        print(f"[label] idx={self.show_idx+1} cz_id={self.cur_cz_id} {kind} → {label}")
+        nk = {"good": "ok", "bad": "err", "unsure": "info",
+              "matched roi visible": "ok", "matched roi not visible": "warn"}.get(label, "info")
+        self._notify(f"labeled cz{self.cur_cz_id}: {label}   (QC'd: {len(self.labels_state)})",
+                     kind=nk)
+        self._draw_match_overlay()  # marker-only refresh (no costly contour re-extract)
+
+    def _accept_pair_label(self, cz_id):
+        """Accept a matched pair (label 'good'), for batch-click; no current-ROI state."""
+        cz_id = int(cz_id)
+        hcr_id = int(self.cz_to_hcr.get(cz_id, -1))
+        soma = float(self.cz_to_soma.get(cz_id, float("nan")))
+        self._write_label(cz_id, hcr_id, soma, "matched", "good")
+
+    def _remove_label(self, cz_id):
+        """Un-QC a pair: drop it from memory AND from the labels CSV (removal is NOT
+        logged — no 'removed' row is written), so it stays removed on reload."""
+        cz_id = int(cz_id)
+        self.labels_state.pop(cz_id, None)
+        if self.labels_path.exists():
+            df = pd.read_csv(self.labels_path)
+            if "cz_id" in df.columns:
+                df = df[df["cz_id"].astype(int) != cz_id]
+                df.to_csv(self.labels_path, index=False)
+        self._qcd_remove(cz_id)
+
+    def _qcd_color(self, lab):
+        return {"good": (40, 200, 40), "bad": (220, 60, 60), "unsure": (200, 180, 40),
+                "matched roi visible": (40, 200, 40),
+                "matched roi not visible": (220, 140, 0)}.get(lab)
+
+    def _qcd_text(self, cz, lab):
+        hcr = self.cz_to_hcr.get(int(cz))
+        base = f"cz{cz} ↔ hcr{hcr}" if hcr is not None else f"cz{cz} (unmatched)"
+        return f"{base}  [{lab}]"
+
+    def _qcd_upsert(self, cz, lab, scroll=True):
+        """Add or update a single QC'd-list row in place (O(1)) — avoids the full
+        rebuild that lagged batch-accept; newest stays scrolled into view."""
+        if not hasattr(self, "qcd_list"):
+            return
+        cz = int(cz)
+        it = self._qcd_items.get(cz)
+        if it is None:
+            it = QtWidgets.QListWidgetItem()
+            it.setData(QtCore.Qt.UserRole, cz)
+            self.qcd_list.addItem(it)
+            self._qcd_items[cz] = it
+        it.setText(self._qcd_text(cz, lab))
+        c = self._qcd_color(lab)
+        if c:
+            it.setForeground(QtGui.QColor(*c))
+        if scroll:
+            self.qcd_list.scrollToItem(it)
+        self.qcd_box.setTitle(f"QC'd pairs ({len(self.labels_state)})")
+
+    def _qcd_remove(self, cz):
+        if not hasattr(self, "qcd_list"):
+            return
+        it = self._qcd_items.pop(int(cz), None)
+        if it is not None:
+            self.qcd_list.takeItem(self.qcd_list.row(it))
+        self.qcd_box.setTitle(f"QC'd pairs ({len(self.labels_state)})")
+
+    def _refresh_qcd_list(self):
+        """Full rebuild (init / reload only)."""
+        if not hasattr(self, "qcd_list"):
+            return
+        self.qcd_list.clear()
+        self._qcd_items = {}
+        for cz, lab in self.labels_state.items():
+            self._qcd_upsert(cz, lab, scroll=False)
+
+    def _sort_qcd_list(self):
+        """Rebuild the QC'd list sorted by label then cz_id (instead of QC order)."""
+        if not hasattr(self, "qcd_list"):
+            return
+        self.qcd_list.clear()
+        self._qcd_items = {}
+        for cz, lab in sorted(self.labels_state.items(),
+                              key=lambda kv: (kv[1], int(kv[0]))):
+            self._qcd_upsert(cz, lab, scroll=False)
+
+    def _on_qcd_double(self, item):
+        cz = int(item.data(QtCore.Qt.UserRole))
+        if cz in self.cz_order:
+            self.show_idx = self.cz_order.index(cz)
+            self._refresh_pair()
+
+    def _remove_selected_qcd(self):
+        it = self.qcd_list.currentItem()
+        if it is not None:
+            self._remove_label(int(it.data(QtCore.Qt.UserRole)))
+            self._draw_match_overlay()
+
+    # ---------------- batch-accept (function 3, MIP) ----------------
+    def _label_at_view(self, arr, bb, vox_xy, vox_z, x, y):
+        """Label id at world (x,y) in the current view: MIP-projected over the ROI's
+        z-extent if in MIP mode, else at the current z slice.  0/out-of-bounds -> None."""
+        yi = int(round((y - bb["y_lo"]) / vox_xy))
+        xi = int(round((x - bb["x_lo"]) / vox_xy))
+        if not (0 <= yi < arr.shape[1] and 0 <= xi < arr.shape[2]):
+            return None
+        if self.mip_mode:
+            mlo, mhi = self.mip_z_world
+            z0 = max(0, int((mlo - bb["z_lo"]) / vox_z))
+            z1 = min(arr.shape[0], int((mhi - bb["z_lo"]) / vox_z) + 1)
+            col = arr[z0:z1, yi, xi]
+            nz = col[col != 0]
+            return int(nz[0]) if nz.size else None
+        zi = int(round((self.cur_z_world - bb["z_lo"]) / vox_z))
+        if 0 <= zi < arr.shape[0]:
+            v = int(arr[zi, yi, xi])
+            return v if v != 0 else None
+        return None
+
+    def _clear_id_text(self):
+        if getattr(self, "_id_text_item", None) is not None:
+            self.view.plot.removeItem(self._id_text_item)
+            self._id_text_item = None
+
+    def _show_roi_ids_at(self, x, y):
+        """Right-click: report CZ + HCR ROI IDs overlapping (x, y) as ephemeral text
+        drawn on the image at the click (cleared when the image changes) + the action
+        label.  If a clicked CZ pair is already QC'd, select its row in the QC'd list."""
+        cz_ids = []
+        for arr in (self.cz_matched_arr, self.cz_unmatched_arr):
+            v = self._label_at_view(arr, self.cz_bb, self.cz_vox, self.cz_vox, x, y)
+            if v and v not in cz_ids:
+                cz_ids.append(v)
+        sources = [(self.hcr_matched_arr, "matched"),
+                   (self.hcr_unmatched_arr, "in-pool unmatched")]
+        if self.hcr_failed_gfp_arr is not None:
+            sources.append((self.hcr_failed_gfp_arr, "failed GFP+"))
+        if self.hcr_failed_cls_arr is not None:
+            sources.append((self.hcr_failed_cls_arr, "failed classifier"))
+        hcr_hits, seen = [], set()
+        for arr, cat in sources:
+            v = self._label_at_view(arr, self.hbb, self.hcr_vox_xy, self.hcr_vox_z, x, y)
+            if v and v not in seen:
+                seen.add(v); hcr_hits.append((v, cat))
+        lines = []
+        for c in cz_ids:
+            partner = self.cz_to_hcr.get(int(c))
+            lines.append(f"CZ {c}" + (f" → hcr {partner}" if partner is not None
+                                      else " (unmatched)"))
+        for v, cat in hcr_hits:
+            extra = ""
+            if cat == "matched":
+                czp = next((cc for cc, hh in self.cz_to_hcr.items() if hh == v), None)
+                if czp is not None:
+                    extra = f" ← cz {czp}"
+            lines.append(f"HCR {v} ({cat}){extra}")
+        msg = " | ".join(lines) if lines else "no ROI at this location"
+        # Ephemeral on-image text at the click (cleared on next image change).
+        self._clear_id_text()
+        ti = pg.TextItem(text=msg.replace(" | ", "\n"), color=(255, 255, 255),
+                         anchor=(0, 0), fill=pg.mkBrush(0, 0, 0, 170))
+        ti.setPos(x, y)
+        self.view.plot.addItem(ti)
+        self._id_text_item = ti
+        self._notify(msg, kind="info")
+        # If a clicked CZ pair is already QC'd, jump to its row in the QC'd list.
+        for c in cz_ids:
+            it = self._qcd_items.get(int(c))
+            if it is not None:
+                self.qcd_list.setCurrentItem(it)
+                self.qcd_list.scrollToItem(it)
+                break
+
+    def _batch_click(self, x, y):
+        """Accept (or toggle-remove) the matched pair whose CZ and HCR ROIs both cover
+        the click point.  Notifies if the click is not on such an overlap."""
+        cz = self._label_at_view(self.cz_matched_arr, self.cz_bb, self.cz_vox,
+                                 self.cz_vox, x, y)
+        hcr = self._label_at_view(self.hcr_matched_arr, self.hbb, self.hcr_vox_xy,
+                                  self.hcr_vox_z, x, y)
+        if cz is None or hcr is None:
+            self._notify("✗ Not added — click within an overlap of CZ & HCR ROI boundaries",
+                         kind="err")
+            return
+        if self.cz_to_hcr.get(int(cz)) != int(hcr):
+            self._notify(f"✗ Not added — cz{cz} & hcr{hcr} do not form a matched pair here",
+                         kind="err")
+            return
+        cz = int(cz)
+        if self.labels_state.get(cz) == "good":
+            self._remove_label(cz)
+            self._notify(f"✗ removed  cz{cz} ↔ hcr{hcr}", kind="warn")
+        else:
+            self._accept_pair_label(cz)
+            self._notify(f"✓ accepted  cz{cz} ↔ hcr{hcr}   (QC'd: {len(self.labels_state)})",
+                         kind="ok")
+        self._draw_match_overlay()  # marker-only refresh (contours unchanged) — no lag
+
+    def _toggle_batch_accept(self):
+        self.batch_accept_mode = self.chk_batch.isChecked()
+        if self.batch_accept_mode:
+            # Mutually exclusive with add-match; nudge into MIP mode.
+            if self.add_match_mode:
+                self.chk_add_match.setChecked(False)
+            if not self.mip_mode:
+                self.rad_mip.setChecked(True)
+            self._notify("Batch-accept ON — left-click a CZ/HCR overlap to accept; "
+                         "click again to remove")
+        self._redraw_contours_only()
+
+    def _draw_qc_markers(self):
+        """Spatial dots for QC'd pairs in view: good=green o, bad=red x, unsure=yellow o."""
+        if not self.show_qc_markers:
+            return
+        (vy_lo, vy_hi), (vx_lo, vx_hi) = self._viewport_xy_range()
+        # Displayed z interval: MIP slab thickness, or the single slice plane.
+        if self.mip_mode:
+            zlo, zhi = self.mip_z_world
+        else:
+            zlo = zhi = self.cur_z_world
+        groups = {"good": [], "bad": [], "unsure": []}
+        for cz, lab in self.labels_state.items():
+            if lab not in groups:
+                continue
+            p = self._cz_pos(cz)
+            if p is None:
+                continue
+            if not (vx_lo <= p[2] <= vx_hi and vy_lo <= p[1] <= vy_hi):
+                continue
+            # Show only when the matched HCR ROI is actually visualised here, i.e. its
+            # z-extent overlaps the displayed slice/slab (same rule for slice + MIP).
+            hcr = self.cz_to_hcr.get(int(cz))
+            zr = self.hcr_zrange.get(int(hcr)) if hcr is not None else None
+            if zr is None or zr[0] > zhi or zr[1] < zlo:
+                continue
+            groups[lab].append((p[2], p[1]))
+        # White ring so markers are visible on the green/magenta image.
+        edge = pg.mkPen((255, 255, 255, 255), width=2.0)
+        style = {"good": ((40, 235, 40), "o", 16), "bad": ((255, 50, 50), "x", 16),
+                 "unsure": ((245, 220, 40), "o", 14)}
+        for lab, pts in groups.items():
+            if not pts:
+                continue
+            col, sym, sz = style[lab]
+            self.view.add_scatter([a for a, _ in pts], [b for _, b in pts],
+                                  color=col, size=sz, symbol=sym, pen=edge)
 
     # ---------------- export (positions + HCR seg crop) ----------------
     def _positions_for(self, cz_id) -> dict:
@@ -1790,6 +2221,9 @@ def launch(sid: str, variant: str = "step3_v3_anchor_vote_wang_end",
            worst_pct: float | None = None):
     """Build the QC window and return (QApplication, QCApp) without entering the
     event loop.  Callers that want a blocking GUI call ``app.exec_()`` after."""
+    # World-writable outputs: /scratch is shared across uids (the GUI often runs as
+    # root while setup ran as claude-user); umask 0 makes labels/exports writable by all.
+    os.umask(0)
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
     win = QCApp(sid, variant, cube_um, start, hcr_level,
                 cz_list_path=cz_list_path, matches_csv=matches_csv,
