@@ -27,7 +27,8 @@ Keys:
   → / ←  next / prev CZ ROI
   ↑ / ↓  Z slice ±1 (slice mode only)
   Shift+wheel  Z slice ±1 (slice mode; plain wheel = zoom)
-  s / m  switch to slice / MIP-cube-Z mode
+  s / d  switch to slice / MIP-cube-Z mode
+  m          toggle QC'd markers
   1 / 2 / 3   matched pair label: good / bad / unsure
   4 / 5       unmatched ROI label: matched-roi visible / not-visible
   q          toggle HCR 488 image
@@ -64,8 +65,9 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
 from .. import config as _config
-from ..data import load_sz_pins, subject_inputs
-from ..benchmark_analysis import load_hcr_volume
+from ..benchmark_data_loader import load_subject
+from ..centroid_helpers import centroids_um
+from ..benchmark_analysis import hcr_level_resolution
 
 # Artifact inputs + label outputs are resolved from config (env-overridable).
 OUT_ROOT = _config.QC_ARTIFACT_DIR
@@ -313,6 +315,10 @@ class QCApp(QtWidgets.QMainWindow):
         qc_dir = OUT_ROOT / self.variant / self.sid
         if not qc_dir.exists():
             sys.exit(f"missing QC artifacts: {qc_dir}")
+        # Launch caches (HCR-488 crop + derived data) live under a dedicated per-subject
+        # dir, separate from the artifacts.
+        self.cache_dir = _config.QC_CACHE_DIR / self.sid
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
         seg_meta = json.loads((qc_dir / "seg_volumes_meta.json").read_text())
         cz_bb = seg_meta["bbox_cz_warped"]
         cz_vox = float(seg_meta["voxel_um_cz_warped"])
@@ -326,17 +332,6 @@ class QCApp(QtWidgets.QMainWindow):
         self.cz_unmatched_arr = tifffile.imread(str(qc_dir / "cz_unmatched_seg.tif"))
         self.hcr_matched_arr   = tifffile.imread(str(qc_dir / "hcr_matched_seg.tif"))
         self.hcr_unmatched_arr = tifffile.imread(str(qc_dir / "hcr_unmatched_seg.tif"))
-        # Per matched-HCR-ROI z-extent (world µm) for MIP marker gating: a QC'd pair's
-        # marker shows in MIP only if its HCR ROI overlaps the MIP slab thickness.
-        from scipy.ndimage import find_objects
-        self.hcr_zrange: dict[int, tuple[float, float]] = {}
-        for k, sl in enumerate(find_objects(self.hcr_matched_arr)):
-            if sl is None:
-                continue
-            self.hcr_zrange[k + 1] = (
-                self.hbb["z_lo"] + sl[0].start * self.hcr_vox_z,
-                self.hbb["z_lo"] + sl[0].stop * self.hcr_vox_z,
-            )
         # Optional: HCR cells that failed each filter (NOT in pool).
         fg_path = qc_dir / "hcr_failed_gfp_seg.tif"
         fc_path = qc_dir / "hcr_failed_classifier_seg.tif"
@@ -373,95 +368,19 @@ class QCApp(QtWidgets.QMainWindow):
                 self.cz_to_somarank[c] = r + 1                  # 1 = least confident
                 self.cz_to_somapct[c] = 1.0 - r / max(1, n - 1)  # ~1 = least confident
 
-        # Matched (have an hcr_id) + unmatched-only CZ ids; queue built from these.
+        # Matched CZ ids (queue built from these + unmatched).
         self.cz_matched_ids = [int(c) for c in self.df_matches["cz_id"]]
-        unmatched_uniq = sorted(set(int(v) for v in np.unique(self.cz_unmatched_arr) if v != 0))
-        matched_set = set(self.cz_matched_ids)
-        self.unmatched_only = [v for v in unmatched_uniq if v not in matched_set]
+        # Derived data (CZ warped centroids, HCR ROI z-ranges, unmatched ids, native
+        # centroids, resolutions, HCR dir) — cached to /scratch so repeat launches skip
+        # the seg-volume numpy reductions AND load_subject.
+        self._load_or_compute_derived(qc_dir, seg_meta)
         self._build_cz_order()
-
-        # CZ centroids in HCR µm (warped grid → world)
-        all_cz_uniq = sorted(set(int(v) for v in np.unique(self.cz_matched_arr) if v != 0) |
-                             set(int(v) for v in np.unique(self.cz_unmatched_arr) if v != 0))
-        cz_combo = np.where(self.cz_matched_arr > 0, self.cz_matched_arr, self.cz_unmatched_arr)
-        cz_centroids_vox = compute_centroids(cz_combo, all_cz_uniq)
-        self.cz_world = {}
-        for v, c in cz_centroids_vox.items():
-            self.cz_world[int(v)] = np.array([
-                cz_bb["z_lo"] + c[0] * cz_vox,
-                cz_bb["y_lo"] + c[1] * cz_vox,
-                cz_bb["x_lo"] + c[2] * cz_vox,
-            ])
-
-        # HCR 488 volume cropped to overlap bbox. Required — retry on transient OSError.
-        import time as _time
-        sz_pins = load_sz_pins()
-        inp = subject_inputs(self.sid, sz_pins=sz_pins)
-        # CZ-native + HCR centroids (zyx µm, keyed by id) for the manual-match
-        # TPS.  The app's display "world" is HCR µm, so hcr_um is already in
-        # world coords; the TPS maps CZ-native µm -> HCR µm (same convention as
-        # build_warped_cz_volume).
-        self.cz_native_by_id = {
-            int(i): np.asarray(p, dtype=float)
-            for i, p in zip(inp.cz_ids, inp.cz_um)
-        }
-        self.hcr_by_id = {
-            int(i): np.asarray(p, dtype=float)
-            for i, p in zip(inp.hcr_ids, inp.hcr_um)
-        }
-        # Kept for the Export feature: subject handle + native resolutions (µm/px)
-        # and an exports dir (under the labels root, /scratch per storage rule).
-        self.s = inp.s
-        self.cz_xy_um = float(inp.s.cz_xy_um)
-        self.cz_z_um = float(inp.s.cz_z_um)
-        self.hcr_xy_um = float(inp.s.hcr_xy_um)
-        self.hcr_z_um = float(inp.s.hcr_z_um)
         self.export_dir = LABELS_ROOT / f"exports_{self.sid}"
         self.export_dir.mkdir(parents=True, exist_ok=True)
-        last_exc = None
-        for attempt in range(3):
-            try:
-                print(f"[qt] loading HCR 488 level {self.hcr_level} "
-                      f"(attempt {attempt + 1}/3) ...", flush=True)
-                vol, xy_um, z_um = load_hcr_volume(
-                    inp.s, channel="488", level=self.hcr_level
-                )
-                break
-            except (OSError, IOError) as exc:
-                last_exc = exc
-                print(f"[qt] HCR 488 read failed ({type(exc).__name__}: {exc}); "
-                      f"sleeping 5s then retrying", file=sys.stderr)
-                _time.sleep(5)
-        else:
-            raise RuntimeError(
-                f"HCR 488 zarr read failed after 3 attempts: {last_exc}"
-            )
-        cz_lp = inp.cz_lp_um
-        # HCR 488 bbox: same Z extent as CZ + 30 µm margin; XY extends 10% of
-        # CZ extent further on each side (so HCR shows context outside CZ).
-        margin_z = 30.0
-        y_ext = float(cz_lp[:, 1].max() - cz_lp[:, 1].min())
-        x_ext = float(cz_lp[:, 2].max() - cz_lp[:, 2].min())
-        margin_y = 30.0 + 0.10 * y_ext
-        margin_x = 30.0 + 0.10 * x_ext
-        z_lo = float(cz_lp[:, 0].min()) - margin_z
-        z_hi = float(cz_lp[:, 0].max()) + margin_z
-        y_lo = float(cz_lp[:, 1].min()) - margin_y
-        y_hi = float(cz_lp[:, 1].max()) + margin_y
-        x_lo = float(cz_lp[:, 2].min()) - margin_x
-        x_hi = float(cz_lp[:, 2].max()) + margin_x
-        z0 = max(0, int(z_lo / z_um));   z1 = min(vol.shape[0], int(z_hi / z_um) + 1)
-        y0 = max(0, int(y_lo / xy_um));  y1 = min(vol.shape[1], int(y_hi / xy_um) + 1)
-        x0 = max(0, int(x_lo / xy_um));  x1 = min(vol.shape[2], int(x_hi / xy_um) + 1)
-        self.hcr488 = vol[z0:z1, y0:y1, x0:x1].astype(np.float32)
-        self.hcr488_origin = (z0 * z_um, y0 * xy_um, x0 * xy_um)
-        self.hcr488_voxel = (float(z_um), float(xy_um), float(xy_um))
-        self.hcr488_levels = (
-            float(np.percentile(self.hcr488, 5)),
-            float(np.percentile(self.hcr488, 99.5)),
-        )
-        print(f"[qt] HCR 488 loaded: {self.hcr488.shape} at {xy_um:.3f} µm/vox xy, "
-              f"{z_um:.3f} µm/vox z ({self.hcr488.nbytes / 1e6:.0f} MB)")
+
+        # HCR 488 background: read only the crop region (the warped-CZ bbox from the
+        # seg meta), and cache it to /scratch so subsequent launches memmap it.
+        self._load_hcr488(qc_dir)
 
         # Warped CZ stack image (TPS-transformed into HCR µm), if present
         cz_warp_tif = qc_dir / "cz_warped_in_hcr_um.tif"
@@ -514,6 +433,161 @@ class QCApp(QtWidgets.QMainWindow):
               f"{len(self.unmatched_only)} unmatched).  "
               f"HCR 488 cube {self.hcr488.shape}, "
               f"{len(self.labels_state)} prior labels.")
+
+    def _load_or_compute_derived(self, qc_dir, seg_meta):
+        """Set per-launch derived data: cz_world (CZ warped centroids), hcr_zrange
+        (matched HCR ROI z-extents), unmatched_only, native CZ/HCR centroids,
+        resolutions, and the HCR dir.  Cached to qc_dir/launch_cache.{json,npz} keyed by
+        the seg counts so repeat launches skip the seg-volume reductions + load_subject."""
+        cache_json = self.cache_dir / f"launch_cache_{self.variant}.json"
+        cache_npz = self.cache_dir / f"launch_cache_{self.variant}.npz"
+        key = {"sid": self.sid, "counts": seg_meta.get("counts"),
+               "cz_vox": self.cz_vox, "hcr_vox_xy": self.hcr_vox_xy}
+        if cache_json.exists() and cache_npz.exists():
+            try:
+                m = json.loads(cache_json.read_text())
+                if m.get("key") == key:
+                    d = np.load(cache_npz)
+                    self.cz_world = {int(i): p for i, p in zip(d["cw_ids"], d["cw_pos"])}
+                    self.hcr_zrange = {int(i): (float(a), float(b))
+                                       for i, (a, b) in zip(d["zr_ids"], d["zr"])}
+                    self.unmatched_only = [int(v) for v in d["unmatched_only"]]
+                    self.cz_native_by_id = {int(i): p for i, p in zip(d["cz_ids"], d["cz_um"])}
+                    self.hcr_by_id = {int(i): p for i, p in zip(d["hcr_ids"], d["hcr_um"])}
+                    self.cz_xy_um = m["cz_xy_um"]; self.cz_z_um = m["cz_z_um"]
+                    self.hcr_xy_um = m["hcr_xy_um"]; self.hcr_z_um = m["hcr_z_um"]
+                    self._hcr_dir = Path(m["hcr_dir"])
+                    self._hcr_seg_xy_um = m["hcr_seg_xy_um"]
+                    self._hcr_seg_z_um = m["hcr_seg_z_um"]
+                    self.s = None
+                    print("[qt] derived data from launch cache")
+                    return
+            except Exception as exc:
+                print(f"[qt] launch cache unreadable ({exc}); recomputing")
+        # ---- cold path: compute everything ----
+        from scipy.ndimage import find_objects
+        self.hcr_zrange = {}
+        for k, sl in enumerate(find_objects(self.hcr_matched_arr)):
+            if sl is None:
+                continue
+            self.hcr_zrange[k + 1] = (self.hbb["z_lo"] + sl[0].start * self.hcr_vox_z,
+                                      self.hbb["z_lo"] + sl[0].stop * self.hcr_vox_z)
+        unmatched_uniq = sorted(set(int(v) for v in np.unique(self.cz_unmatched_arr) if v != 0))
+        matched_set = set(self.cz_matched_ids)
+        self.unmatched_only = [v for v in unmatched_uniq if v not in matched_set]
+        all_cz = sorted(set(int(v) for v in np.unique(self.cz_matched_arr) if v != 0)
+                        | set(unmatched_uniq))
+        combo = np.where(self.cz_matched_arr > 0, self.cz_matched_arr, self.cz_unmatched_arr)
+        cz_centroids_vox = compute_centroids(combo, all_cz)
+        self.cz_world = {int(v): np.array([self.cz_bb["z_lo"] + c[0] * self.cz_vox,
+                                           self.cz_bb["y_lo"] + c[1] * self.cz_vox,
+                                           self.cz_bb["x_lo"] + c[2] * self.cz_vox])
+                         for v, c in cz_centroids_vox.items()}
+        s = load_subject(self.sid)
+        cz_um, cz_ids = centroids_um(s, "cz")
+        hcr_um, hcr_ids = centroids_um(s, "hcr_all")
+        self.cz_native_by_id = {int(i): np.asarray(p, float) for i, p in zip(cz_ids, cz_um)}
+        self.hcr_by_id = {int(i): np.asarray(p, float) for i, p in zip(hcr_ids, hcr_um)}
+        self.cz_xy_um = float(s.cz_xy_um); self.cz_z_um = float(s.cz_z_um)
+        self.hcr_xy_um = float(s.hcr_xy_um); self.hcr_z_um = float(s.hcr_z_um)
+        self._hcr_dir = Path(s.hcr_dir)
+        self._hcr_seg_xy_um = float(s.hcr_seg_xy_um)
+        self._hcr_seg_z_um = float(s.hcr_seg_z_um)
+        self.s = s
+        try:
+            cw_ids = np.fromiter(self.cz_world.keys(), dtype=np.int64)
+            cw_pos = (np.array([self.cz_world[int(i)] for i in cw_ids], dtype=np.float32)
+                      if len(cw_ids) else np.zeros((0, 3), np.float32))
+            zr_ids = np.fromiter(self.hcr_zrange.keys(), dtype=np.int64)
+            zr = (np.array([self.hcr_zrange[int(i)] for i in zr_ids], dtype=np.float32)
+                  if len(zr_ids) else np.zeros((0, 2), np.float32))
+            np.savez(cache_npz, cw_ids=cw_ids, cw_pos=cw_pos, zr_ids=zr_ids, zr=zr,
+                     unmatched_only=np.array(self.unmatched_only, dtype=np.int64),
+                     cz_ids=np.asarray(cz_ids, np.int64), cz_um=np.asarray(cz_um, np.float32),
+                     hcr_ids=np.asarray(hcr_ids, np.int64), hcr_um=np.asarray(hcr_um, np.float32))
+            cache_json.write_text(json.dumps({
+                "key": key, "cz_xy_um": self.cz_xy_um, "cz_z_um": self.cz_z_um,
+                "hcr_xy_um": self.hcr_xy_um, "hcr_z_um": self.hcr_z_um,
+                "hcr_dir": str(self._hcr_dir), "hcr_seg_xy_um": self._hcr_seg_xy_um,
+                "hcr_seg_z_um": self._hcr_seg_z_um}))
+        except Exception as exc:
+            print(f"[qt] WARN: could not write launch cache ({exc})")
+
+    def _seg_subject(self):
+        """A subject-like object exposing the fields open_hcr_seg_zarr_array needs —
+        the real SubjectData if loaded, else a stub from the cached HCR dir + seg res
+        (so HCR-seg export works on a warm launch without load_subject)."""
+        if getattr(self, "s", None) is not None:
+            return self.s
+        import types
+        return types.SimpleNamespace(hcr_dir=self._hcr_dir,
+                                     hcr_seg_xy_um=self._hcr_seg_xy_um,
+                                     hcr_seg_z_um=self._hcr_seg_z_um)
+
+    def _load_hcr488(self, qc_dir):
+        """Load the HCR 488 background cropped to the warped-CZ bbox (self.cz_bb).
+        Reads ONLY the crop region from the zarr (not the full pyramid level), then
+        caches it under qc_dir as .npy so later launches memmap it instantly."""
+        import time as _time
+        bb = self.cz_bb
+        level = self.hcr_level
+        cache_npy = self.cache_dir / f"hcr488_{self.variant}_L{level}.npy"
+        cache_meta = self.cache_dir / f"hcr488_{self.variant}_L{level}.json"
+        key = {"bbox": [bb["z_lo"], bb["z_hi"], bb["y_lo"], bb["y_hi"],
+                        bb["x_lo"], bb["x_hi"]], "level": int(level)}
+        # Fast path: cached crop matching this bbox+level -> memmap (no decode).
+        if cache_npy.exists() and cache_meta.exists():
+            try:
+                m = json.loads(cache_meta.read_text())
+                if m.get("key") == key:
+                    self.hcr488 = np.load(cache_npy, mmap_mode="r")
+                    self.hcr488_origin = tuple(m["origin"])
+                    self.hcr488_voxel = tuple(m["voxel"])
+                    self.hcr488_levels = tuple(m["levels"])
+                    print(f"[qt] HCR 488 from cache {cache_npy.name} {self.hcr488.shape}")
+                    return
+            except Exception as exc:
+                print(f"[qt] HCR488 cache unreadable ({exc}); re-reading")
+        # Slow path: read just the crop from the zarr (uses cached HCR dir/res — no
+        # dependency on self.s, so it works whether or not the subject was loaded).
+        import zarr
+        zpath = self._hcr_dir / "image_tile_fusing" / "fused" / "channel_488.zarr"
+        xy_um = self.hcr_xy_um * (2 ** (level - 2))
+        z_um = self.hcr_z_um * (2 ** max(0, level - 2))
+        last_exc = None
+        for attempt in range(3):
+            try:
+                print(f"[qt] reading HCR 488 crop (level {level}, attempt {attempt+1}/3) ...",
+                      flush=True)
+                node = zarr.open(str(zpath), mode="r")[str(level)]
+                Z, Y, X = node.shape[-3:]
+                z0 = max(0, int(bb["z_lo"] / z_um)); z1 = min(Z, int(bb["z_hi"] / z_um) + 1)
+                y0 = max(0, int(bb["y_lo"] / xy_um)); y1 = min(Y, int(bb["y_hi"] / xy_um) + 1)
+                x0 = max(0, int(bb["x_lo"] / xy_um)); x1 = min(X, int(bb["x_hi"] / xy_um) + 1)
+                crop = np.asarray(node[0, 0, z0:z1, y0:y1, x0:x1]).astype(np.float32)
+                break
+            except (OSError, IOError) as exc:
+                last_exc = exc
+                print(f"[qt] HCR 488 read failed ({type(exc).__name__}: {exc}); retry 5s",
+                      file=sys.stderr)
+                _time.sleep(5)
+        else:
+            raise RuntimeError(f"HCR 488 zarr read failed after 3 attempts: {last_exc}")
+        self.hcr488 = crop
+        self.hcr488_origin = (z0 * z_um, y0 * xy_um, x0 * xy_um)
+        self.hcr488_voxel = (float(z_um), float(xy_um), float(xy_um))
+        self.hcr488_levels = (float(np.percentile(crop, 5)),
+                              float(np.percentile(crop, 99.5)))
+        print(f"[qt] HCR 488 crop {crop.shape} ({crop.nbytes/1e6:.0f} MB) "
+              f"@ {xy_um:.3f}µm xy; caching ...", flush=True)
+        try:
+            np.save(cache_npy, crop)
+            cache_meta.write_text(json.dumps({
+                "key": key, "origin": list(self.hcr488_origin),
+                "voxel": list(self.hcr488_voxel), "levels": list(self.hcr488_levels),
+                "shape": list(crop.shape)}))
+        except Exception as exc:
+            print(f"[qt] WARN: could not cache HCR 488 ({exc})")
 
     # ---------------- soma scores + review queue (G3) ----------------
     def _load_soma_scores(self, qc_dir, matches_csv) -> dict:
@@ -908,24 +982,57 @@ class QCApp(QtWidgets.QMainWindow):
 
     # ---------------- UI ----------------
     def _build_ui(self):
-        cw = QtWidgets.QWidget()
-        h = QtWidgets.QHBoxLayout()
-        cw.setLayout(h)
-        self.setCentralWidget(cw)
+        # Three resizable panes (image | controls | QC'd) — drag the handles to
+        # adjust each pane's width.
+        h = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        h.setChildrenCollapsible(False)
+        h.setHandleWidth(6)
+        self._splitter = h
+        self.setCentralWidget(h)
 
-        # Image area
+        # Left column: compact horizontal toggle toolbar above the image area.
+        left = QtWidgets.QWidget()
+        lv = QtWidgets.QVBoxLayout(); lv.setContentsMargins(0, 0, 0, 0); lv.setSpacing(2)
+        left.setLayout(lv)
+        bar = QtWidgets.QHBoxLayout(); bar.setSpacing(10); bar.setContentsMargins(2, 0, 2, 0)
         self.view = CubeView()
-        h.addWidget(self.view, stretch=4)
 
-        # Right control panel — kept narrow so the image gets the space.
+        def _tb(text, checked, slot, tip=""):
+            cb = QtWidgets.QCheckBox(text)
+            cb.setChecked(checked)          # set before connecting -> no slot call now
+            if tip:
+                cb.setToolTip(tip)
+            cb.stateChanged.connect(lambda _=0: slot())
+            bar.addWidget(cb)
+            return cb
+        self.chk_hcr488 = _tb("488 (q)", True, self._toggle_hcr488, "HCR 488 image")
+        self.chk_czw = _tb("CZ img (w)", True, self._toggle_czw, "CZ warped image")
+        self.chk_cur_cz = _tb("pair CZ (z)", True, self._toggle_cur_cz)
+        self.chk_cur_hcr = _tb("pair HCR (x)", True, self._toggle_cur_hcr)
+        self.chk_other_cz = _tb("other CZ (c)", True, self._toggle_other_cz)
+        self.chk_other_hcr = _tb("other HCR (v)", True, self._toggle_other_hcr)
+        self.chk_hcr_fail_gfp = _tb("failGFP (b)", False, self._toggle_hcr_fail_gfp)
+        self.chk_hcr_fail_cls = _tb("failCLS (n)", False, self._toggle_hcr_fail_cls)
+        self.chk_qc_markers = _tb("markers (m)", True, self._toggle_qc_markers,
+                                  "QC'd pair dots: good=green, bad=red, unsure=yellow")
+        bar.addStretch(1)
+        lv.addLayout(bar)
+        lv.addWidget(self.view, stretch=1)
+        h.addWidget(left)
+
+        # Right control panel — scrollable so the window can shrink and add-match
+        # mode can't push controls off-screen.
         panel = QtWidgets.QWidget()
-        panel.setMaximumWidth(240)
-        panel.setMinimumWidth(200)
         pl = QtWidgets.QVBoxLayout()
-        pl.setContentsMargins(4, 4, 4, 4)
+        pl.setContentsMargins(4, 4, 18, 4)  # right margin leaves room for the scrollbar
         pl.setSpacing(4)
         panel.setLayout(pl)
-        h.addWidget(panel, stretch=0)
+        panel_scroll = QtWidgets.QScrollArea()
+        panel_scroll.setWidgetResizable(True)
+        panel_scroll.setWidget(panel)
+        panel_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        panel_scroll.setMinimumWidth(180)  # splitter-resizable; no max so it can widen
+        h.addWidget(panel_scroll)
 
         self.lbl_status = QtWidgets.QLabel("…")
         self.lbl_status.setStyleSheet("font-weight: bold;")
@@ -985,58 +1092,18 @@ class QCApp(QtWidgets.QMainWindow):
                 auto_fn=lambda: self._auto_contrast("cz"),
             )
 
-        # Toggles
-        self.chk_hcr488 = QtWidgets.QCheckBox("HCR 488 image (q)")
-        self.chk_hcr488.setChecked(True)
-        self.chk_hcr488.stateChanged.connect(lambda _: self._toggle_hcr488())
-        pl.addWidget(self.chk_hcr488)
-        self.chk_czw = QtWidgets.QCheckBox("CZ warped image (w)")
-        self.chk_czw.setChecked(True)
-        self.chk_czw.stateChanged.connect(lambda _: self._toggle_czw())
-        pl.addWidget(self.chk_czw)
-        # Mode: slice / MIP
+        # View mode: slice / MIP.  (Image/ROI toggle checkboxes are in the top toolbar.)
         mode_box = QtWidgets.QGroupBox("View mode")
         mode_layout = QtWidgets.QHBoxLayout()
         mode_box.setLayout(mode_layout)
         self.rad_slice = QtWidgets.QRadioButton("Slice (s)")
         self.rad_slice.setChecked(True)
-        self.rad_mip = QtWidgets.QRadioButton("MIP cube Z (m)")
+        self.rad_mip = QtWidgets.QRadioButton("MIP cube Z (d)")
         self.rad_slice.toggled.connect(lambda checked: checked and self._set_mode(False))
         self.rad_mip.toggled.connect(lambda checked: checked and self._set_mode(True))
         mode_layout.addWidget(self.rad_slice)
         mode_layout.addWidget(self.rad_mip)
         pl.addWidget(mode_box)
-
-        self.chk_cur_cz = QtWidgets.QCheckBox("Pair CZ ROI (z)")
-        self.chk_cur_cz.setChecked(True)
-        self.chk_cur_cz.stateChanged.connect(lambda _: self._toggle_cur_cz())
-        pl.addWidget(self.chk_cur_cz)
-        self.chk_cur_hcr = QtWidgets.QCheckBox("Pair HCR ROI (x)")
-        self.chk_cur_hcr.setChecked(True)
-        self.chk_cur_hcr.stateChanged.connect(lambda _: self._toggle_cur_hcr())
-        pl.addWidget(self.chk_cur_hcr)
-        self.chk_other_cz = QtWidgets.QCheckBox("Other CZ ROIs (c)")
-        self.chk_other_cz.setChecked(True)
-        self.chk_other_cz.stateChanged.connect(lambda _: self._toggle_other_cz())
-        pl.addWidget(self.chk_other_cz)
-        self.chk_other_hcr = QtWidgets.QCheckBox("Other HCR ROIs (v)")
-        self.chk_other_hcr.setChecked(True)
-        self.chk_other_hcr.stateChanged.connect(lambda _: self._toggle_other_hcr())
-        pl.addWidget(self.chk_other_hcr)
-        self.chk_hcr_fail_gfp = QtWidgets.QCheckBox("HCR failed GFP+ (b)")
-        self.chk_hcr_fail_gfp.setChecked(False)
-        self.chk_hcr_fail_gfp.stateChanged.connect(lambda _: self._toggle_hcr_fail_gfp())
-        pl.addWidget(self.chk_hcr_fail_gfp)
-        self.chk_hcr_fail_cls = QtWidgets.QCheckBox("HCR failed ROI classifier (n)")
-        self.chk_hcr_fail_cls.setChecked(False)
-        self.chk_hcr_fail_cls.stateChanged.connect(lambda _: self._toggle_hcr_fail_cls())
-        pl.addWidget(self.chk_hcr_fail_cls)
-        self.chk_qc_markers = QtWidgets.QCheckBox("QC'd markers")
-        self.chk_qc_markers.setToolTip("Spatial dots for QC'd pairs: good=green, "
-                                       "bad=red, unsure=yellow")
-        self.chk_qc_markers.setChecked(True)
-        self.chk_qc_markers.stateChanged.connect(lambda _: self._toggle_qc_markers())
-        pl.addWidget(self.chk_qc_markers)
 
         # Radio group — built lazily per-pair (different options for matched/unmatched)
         self.radio_box = QtWidgets.QGroupBox("Label (auto-save)")
@@ -1078,23 +1145,6 @@ class QCApp(QtWidgets.QMainWindow):
         self.match_box.setVisible(False)
         pl.addWidget(self.match_box)
 
-        # ---- Export (XYZ positions + HCR seg crop) ----
-        exp_box = QtWidgets.QGroupBox("Export")
-        el = QtWidgets.QVBoxLayout(); exp_box.setLayout(el)
-        b_copy = QtWidgets.QPushButton("Copy pair XYZ (p)")
-        b_copy.setToolTip("Copy current pair's XYZ in czstack-native + HCR coords to clipboard")
-        b_copy.clicked.connect(self._copy_positions)
-        b_allpos = QtWidgets.QPushButton("Export all positions CSV")
-        b_allpos.clicked.connect(self._export_all_positions)
-        b_segcrop = QtWidgets.QPushButton("Export HCR seg crop")
-        b_segcrop.setToolTip("Save raw HCR segmentation labels near this pair as a tif")
-        b_segcrop.clicked.connect(self._export_hcr_seg_crop)
-        el.addWidget(b_copy); el.addWidget(b_allpos); el.addWidget(b_segcrop)
-        self.lbl_export = QtWidgets.QLabel("")
-        self.lbl_export.setWordWrap(True)
-        el.addWidget(self.lbl_export)
-        pl.addWidget(exp_box)
-
         # Nav buttons
         nav_row = QtWidgets.QHBoxLayout()
         b_prev = QtWidgets.QPushButton("← Prev")
@@ -1109,8 +1159,7 @@ class QCApp(QtWidgets.QMainWindow):
 
         # ---- Far-right column: QC'd pairs (scrollable) + last action + save target ----
         qcd_panel = QtWidgets.QWidget()
-        qcd_panel.setMaximumWidth(270)
-        qcd_panel.setMinimumWidth(210)
+        qcd_panel.setMinimumWidth(180)  # splitter-resizable; no max so it can widen
         qv = QtWidgets.QVBoxLayout()
         qv.setContentsMargins(4, 4, 4, 4); qv.setSpacing(4)
         qcd_panel.setLayout(qv)
@@ -1135,6 +1184,22 @@ class QCApp(QtWidgets.QMainWindow):
         b_rm.clicked.connect(self._remove_selected_qcd)
         ql2.addWidget(b_rm)
         qv.addWidget(self.qcd_box, stretch=1)
+        # ---- Export (XYZ positions + HCR seg crop) ----
+        exp_box = QtWidgets.QGroupBox("Export")
+        el = QtWidgets.QVBoxLayout(); exp_box.setLayout(el)
+        b_copy = QtWidgets.QPushButton("Copy pair XYZ (p)")
+        b_copy.setToolTip("Copy current pair's XYZ in czstack-native + HCR coords to clipboard")
+        b_copy.clicked.connect(self._copy_positions)
+        b_allpos = QtWidgets.QPushButton("Export all positions CSV")
+        b_allpos.clicked.connect(self._export_all_positions)
+        b_segcrop = QtWidgets.QPushButton("Export HCR seg crop")
+        b_segcrop.setToolTip("Save raw HCR segmentation labels near this pair as a tif")
+        b_segcrop.clicked.connect(self._export_hcr_seg_crop)
+        el.addWidget(b_copy); el.addWidget(b_allpos); el.addWidget(b_segcrop)
+        self.lbl_export = QtWidgets.QLabel("")
+        self.lbl_export.setWordWrap(True)
+        el.addWidget(self.lbl_export)
+        qv.addWidget(exp_box)
         # save target: show path + let the user choose folder/filename
         self.lbl_savepath = QtWidgets.QLabel("")
         self.lbl_savepath.setWordWrap(True)
@@ -1143,7 +1208,13 @@ class QCApp(QtWidgets.QMainWindow):
         b_save = QtWidgets.QPushButton("Set save file…")
         b_save.clicked.connect(self._choose_save_file)
         qv.addWidget(b_save)
-        h.addWidget(qcd_panel, stretch=0)
+        h.addWidget(qcd_panel)
+        # Only the image pane stretches when the window resizes; panels keep width
+        # until dragged.  Initial pane widths:
+        h.setStretchFactor(0, 1)
+        h.setStretchFactor(1, 0)
+        h.setStretchFactor(2, 0)
+        h.setSizes([760, 250, 250])
         self._update_savepath_label()
 
         # Keyboard shortcuts
@@ -1166,8 +1237,9 @@ class QCApp(QtWidgets.QMainWindow):
         self._mk_shortcut("4", lambda: self._radio_key(4))
         self._mk_shortcut("q", lambda: self.chk_hcr488.toggle())  # q → 488 image
         self._mk_shortcut("w", lambda: self.chk_czw.toggle())     # w → warped CZ image
-        self._mk_shortcut("m", lambda: self.rad_mip.setChecked(True))
+        self._mk_shortcut("m", lambda: self.chk_qc_markers.toggle())  # m → QC'd markers
         self._mk_shortcut("s", lambda: self.rad_slice.setChecked(True))
+        self._mk_shortcut("d", lambda: self.rad_mip.setChecked(True))  # d → MIP cube
         self._mk_shortcut("b", lambda: self.chk_hcr_fail_gfp.toggle())
         self._mk_shortcut("n", lambda: self.chk_hcr_fail_cls.toggle())
         self._mk_shortcut("u", lambda: self.chk_add_match.toggle())
@@ -1194,23 +1266,23 @@ class QCApp(QtWidgets.QMainWindow):
         vb = self.view.plot.getViewBox()
         vb.sigRangeChanged.connect(lambda *a, **k: self._range_timer.start())
 
-        self.resize(1100, 800)
+        self.setMinimumSize(720, 480)  # allow the user to shrink the window
+        self.resize(1000, 740)
 
     def _square_image(self):
-        """Widen the window so the image area (CubeView) is ~square.  The two side
-        panels are fixed-width, so adding (height - width) of the view to the window
-        width makes the view square; clamped to the available screen width."""
+        """Widen the window so the image area (CubeView) is ~square (side panels are
+        fixed-width), clamped to fit the screen in both width and height."""
         vw, vh = self.view.width(), self.view.height()
         if vw <= 0 or vh <= 0:
             return
-        delta = vh - vw
-        if abs(delta) < 4:
-            return
-        new_w = self.width() + delta
+        new_w = self.width() + (vh - vw)
+        new_h = self.height()
         screen = QtWidgets.QApplication.primaryScreen()
         if screen is not None:
-            new_w = min(new_w, int(screen.availableGeometry().width() * 0.98))
-        self.resize(max(900, new_w), self.height())
+            a = screen.availableGeometry()
+            new_w = min(new_w, int(a.width() * 0.98))
+            new_h = min(new_h, int(a.height() * 0.95))
+        self.resize(max(self.minimumWidth(), new_w), max(self.minimumHeight(), new_h))
 
     def _redraw_contours_only(self):
         """Refresh contours for the current viewport without touching images."""
@@ -1232,14 +1304,16 @@ class QCApp(QtWidgets.QMainWindow):
         + Auto button.  Returns (hist_widget, spin_min, spin_max, btn_auto).
         Spinboxes are kept in sync with the histogram's region."""
         parent_layout.addWidget(QtWidgets.QLabel(f"<b>Contrast — {label}</b>"))
-        hist = pg.HistogramLUTWidget()
+        try:                       # horizontal histogram is short -> saves vertical space
+            hist = pg.HistogramLUTWidget(orientation="horizontal")
+        except TypeError:          # older pyqtgraph without the orientation kwarg
+            hist = pg.HistogramLUTWidget()
         hist.setImageItem(img)
         hist.gradient.restoreState({
             "mode": "rgb",
             "ticks": [(0.0, (0, 0, 0, 255)), (1.0, (*gradient_rgb, 255))],
         })
-        hist.setMaximumHeight(110)
-        hist.setMaximumWidth(230)
+        hist.setMaximumHeight(90)
         parent_layout.addWidget(hist)
 
         row = QtWidgets.QHBoxLayout()
@@ -2184,7 +2258,7 @@ class QCApp(QtWidgets.QMainWindow):
             self._set_export_status("no HCR location for this ROI")
             return
         from .build_artifacts import open_hcr_seg_zarr_array
-        slicer, (Z, Y, X), xy_um, z_um = open_hcr_seg_zarr_array(self.s)
+        slicer, (Z, Y, X), xy_um, z_um = open_hcr_seg_zarr_array(self._seg_subject())
         h = float(self.cube_half)
         z0 = max(0, int((center[0] - h) / z_um)); z1 = min(Z, int((center[0] + h) / z_um) + 1)
         y0 = max(0, int((center[1] - h) / xy_um)); y1 = min(Y, int((center[1] + h) / xy_um) + 1)

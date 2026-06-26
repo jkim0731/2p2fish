@@ -105,3 +105,7 @@ QC_LABELS_DIR = Path(
 QC_MATCHES_DIR = Path(
     os.environ.get("MFISH_QC_MATCHES_DIR", "/scratch/autocoreg_outputs/matches")
 )
+# QC-app launch cache (HCR-488 crop + derived data) — per subject: <QC_CACHE_DIR>/<sid>/.
+QC_CACHE_DIR = Path(
+    os.environ.get("MFISH_QC_CACHE_DIR", "/scratch/autocoreg_qc_cache")
+)
