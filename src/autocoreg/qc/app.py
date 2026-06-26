@@ -26,7 +26,7 @@ Add-match mode (function 2 — manual registration improvement):
 Keys:
   → / ←  next / prev CZ ROI
   ↑ / ↓  Z slice ±1 (slice mode only)
-  Shift+wheel  Z slice ±1 (slice mode; plain wheel = zoom)
+  wheel        Z slice ±1 (slice mode) ;  Shift+wheel = zoom
   s / d  switch to slice / MIP-cube-Z mode
   m          toggle QC'd markers
   1 / 2 / 3   matched pair label: good / bad / unsure
@@ -354,6 +354,8 @@ class QCApp(QtWidgets.QMainWindow):
         self.cz_to_hcr = dict(zip(
             self.df_matches["cz_id"], self.df_matches["hcr_id"]
         ))
+        # Snapshot the matcher's original mapping so add-match overrides can be undone.
+        self._auto_cz_to_hcr = dict(self.cz_to_hcr)
         # Per-pair soma-print score (G2): the production Wang final CSV has no
         # soma_score column, so load/compute final_pairs.csv (cz_id,hcr_id,soma_score)
         # — soma is a DISTANCE, lower = better match.  cz_to_soma drives the queue sort.
@@ -680,6 +682,7 @@ class QCApp(QtWidgets.QMainWindow):
         self.show_hcr_fail_gfp = False
         self.show_hcr_fail_cls = False
         self.show_qc_markers = True   # spatial dots for QC'd pairs (good/bad/unsure)
+        self.skip_qcd = True          # Next/Prev skip already-QC'd pairs
         self.batch_accept_mode = False  # MIP left-click accept (function 3)
         self._id_text_item = None     # ephemeral on-image ROI-ID text (right-click)
         self.mip_mode = False  # toggled by 'm' / radio
@@ -704,10 +707,12 @@ class QCApp(QtWidgets.QMainWindow):
         for cz_id, hcr_id in self.cz_to_hcr.items():
             if int(cz_id) in self.cz_native_by_id and int(hcr_id) in self.hcr_by_id:
                 self.active_pairs[int(cz_id)] = int(hcr_id)
-        # Replay prior manual add/undo events (resume across sessions).
+        # Replay prior manual add/undo events (resume across sessions).  Also re-apply
+        # the cz->hcr override so the QC'd list / export show the manual partner.
         for action, cz, hc in getattr(self, "_prior_manual_events", []):
             if action == "add" and cz in self.cz_native_by_id and hc in self.hcr_by_id:
                 self.active_pairs[cz] = hc
+                self.cz_to_hcr[cz] = hc
                 if cz in self.added_order:
                     self.added_order.remove(cz)
                 self.added_order.append(cz)
@@ -716,9 +721,13 @@ class QCApp(QtWidgets.QMainWindow):
                     self.active_pairs.pop(cz, None)
                 if cz in self.added_order:
                     self.added_order.remove(cz)
-                orig = self.cz_to_hcr.get(cz)
-                if orig is not None and int(orig) in self.hcr_by_id:
-                    self.active_pairs[cz] = int(orig)
+                orig = self._auto_cz_to_hcr.get(cz)
+                if orig is not None:
+                    self.cz_to_hcr[cz] = int(orig)
+                    if int(orig) in self.hcr_by_id:
+                        self.active_pairs[cz] = int(orig)
+                else:
+                    self.cz_to_hcr.pop(cz, None)
         self._refit_tps()
 
     # ---------------- manual-match (function 2) ----------------
@@ -869,9 +878,16 @@ class QCApp(QtWidgets.QMainWindow):
         self.added_order.append(cz)
         self._refit_tps()
         self._save_manual_match(cz, hc, "add")
+        # Make the manual link the pair's HCR partner everywhere, and record it as a
+        # QC'd pair (label "manual") so it shows in the QC'd list + exports.
+        self.cz_to_hcr[cz] = hc
+        self._write_label(cz, hc, float(self.cz_to_soma.get(cz, float("nan"))),
+                          "manual", "manual")
         self.pending_cz_id = None
         self.pending_hcr_id = None
         self._set_match_status(self._counts_summary() + "  (added, TPS refit)")
+        self._notify(f"✓ manual cz{cz} ↔ hcr{hc}   (QC'd: {len(self.labels_state)})",
+                     kind="ok")
         self._update_match_buttons()
         self._redraw()
 
@@ -881,13 +897,20 @@ class QCApp(QtWidgets.QMainWindow):
             return
         cz = self.added_order.pop()
         hc = self.active_pairs.pop(cz, None)
-        # If the cz was originally a seeded match, restore that mapping.
-        orig = self.cz_to_hcr.get(cz)
-        if orig is not None and int(orig) in self.hcr_by_id:
-            self.active_pairs[cz] = int(orig)
+        # Restore the original (matcher) mapping for this cz, and drop the manual QC entry.
+        orig = self._auto_cz_to_hcr.get(cz)
+        if orig is not None:
+            self.cz_to_hcr[cz] = int(orig)
+            if int(orig) in self.hcr_by_id:
+                self.active_pairs[cz] = int(orig)
+        else:
+            self.cz_to_hcr.pop(cz, None)
+        if self.labels_state.get(cz) == "manual":
+            self._remove_label(cz)
         self._refit_tps()
         self._save_manual_match(cz, hc if hc is not None else -1, "undo")
         self._set_match_status(self._counts_summary() + f"  (undid cz_id={cz})")
+        self._notify(f"✗ undid manual cz{cz}", kind="warn")
         self._update_match_buttons()
         self._redraw()
 
@@ -1061,6 +1084,13 @@ class QCApp(QtWidgets.QMainWindow):
         btn_worst.clicked.connect(self._rebuild_queue)
         wrow.addWidget(self.spin_worst); wrow.addWidget(btn_worst)
         ql.addLayout(wrow)
+        self.chk_skip_qcd = QtWidgets.QCheckBox("Un-QC'd only (Next/Prev)")
+        self.chk_skip_qcd.setChecked(self.skip_qcd)
+        self.chk_skip_qcd.setToolTip("On: Next/Prev skip already-QC'd pairs (walk only "
+                                     "undecided ones).  Off: step through all in sort order.")
+        self.chk_skip_qcd.stateChanged.connect(
+            lambda _: setattr(self, "skip_qcd", self.chk_skip_qcd.isChecked()))
+        ql.addWidget(self.chk_skip_qcd)
         self.lbl_queue = QtWidgets.QLabel("")
         self.lbl_queue.setWordWrap(True)
         ql.addWidget(self.lbl_queue)
@@ -1200,11 +1230,13 @@ class QCApp(QtWidgets.QMainWindow):
         self.lbl_export.setWordWrap(True)
         el.addWidget(self.lbl_export)
         qv.addWidget(exp_box)
-        # save target: show path + let the user choose folder/filename
-        self.lbl_savepath = QtWidgets.QLabel("")
-        self.lbl_savepath.setWordWrap(True)
-        self.lbl_savepath.setStyleSheet("color: #555;")
-        qv.addWidget(self.lbl_savepath)
+        # save target: show path in a read-only, horizontally-scrollable field (drag /
+        # arrow-keys to see the full path; tooltip has it in full) + a chooser button.
+        qv.addWidget(QtWidgets.QLabel("Saving QC labels to:"))
+        self.savepath_edit = QtWidgets.QLineEdit()
+        self.savepath_edit.setReadOnly(True)
+        self.savepath_edit.setStyleSheet("color: #555;")
+        qv.addWidget(self.savepath_edit)
         b_save = QtWidgets.QPushButton("Set save file…")
         b_save.clicked.connect(self._choose_save_file)
         qv.addWidget(b_save)
@@ -1254,7 +1286,7 @@ class QCApp(QtWidgets.QMainWindow):
         # Keep pyqtgraph's right-click menu; add a "Show IDs" action to it.
         self._last_rc_world = None
         self.view.plot.getViewBox().menu.addAction("Show IDs", self._show_ids_from_menu)
-        # Shift + mouse-wheel over the image steps the Z slice (plain wheel = zoom).
+        # Wheel steps the Z slice; Shift+wheel zooms (handled in eventFilter).
         self.view.plot.viewport().installEventFilter(self)
 
         # Debounced re-draw of contours on pan/zoom (so contours always cover
@@ -1528,9 +1560,9 @@ class QCApp(QtWidgets.QMainWindow):
         self.z_slider.setValue(max(self.z_slider.value() - 1, 0))
 
     def eventFilter(self, obj, ev):
-        """Shift+wheel = step Z (consume so it doesn't also zoom).  Right-click:
-        record the position (for the menu's 'Show IDs'); Shift+right-click shows the
-        ROI IDs immediately and is consumed (so the context menu doesn't pop)."""
+        """Wheel = step Z (slice mode); Shift+wheel = zoom (falls through to pyqtgraph).
+        In MIP mode plain wheel also zooms (no Z to step).  Right-click: record the
+        position for the menu's 'Show IDs'; Shift+right-click shows IDs and is consumed."""
         t = ev.type()
         if t == QtCore.QEvent.MouseButtonPress and ev.button() == QtCore.Qt.RightButton:
             sp = self.view.plot.mapToScene(ev.pos())
@@ -1540,14 +1572,16 @@ class QCApp(QtWidgets.QMainWindow):
                 self._show_roi_ids_at(*self._last_rc_world)
                 return True  # consume -> no context menu
             # plain right-click falls through -> pyqtgraph menu (with "Show IDs")
-        elif t == QtCore.QEvent.Wheel and (ev.modifiers() & QtCore.Qt.ShiftModifier):
-            if not self.mip_mode:
+        elif t == QtCore.QEvent.Wheel:
+            shift = bool(ev.modifiers() & QtCore.Qt.ShiftModifier)
+            if not shift and not self.mip_mode:
                 dy = ev.angleDelta().y()
                 if dy > 0:
                     self._z_up()
                 elif dy < 0:
                     self._z_down()
-            return True  # consume (no zoom) whenever Shift is held
+                return True   # consume -> plain wheel = Z, no zoom
+            # Shift+wheel (or any wheel in MIP) -> fall through to pyqtgraph zoom.
         return super().eventFilter(obj, ev)
 
     def _show_ids_from_menu(self):
@@ -1805,11 +1839,16 @@ class QCApp(QtWidgets.QMainWindow):
 
     # ---------------- nav + toggles + label ----------------
     def _step_to_unqcd(self, direction: int):
-        """Move to the nearest NOT-yet-QC'd pair in ``direction`` (+1 next, -1 prev).
-        Both arrows traverse the dynamic (un-QC'd) queue symmetrically, so →then← (or
-        ←then→) returns you to the same un-QC'd cell.  Revisit a QC'd pair by
-        double-clicking it in the QC'd list."""
+        """Move one ROI in ``direction`` (+1 next, -1 prev).  If 'Un-QC'd only' is on
+        (self.skip_qcd), skip already-QC'd pairs so nav walks only the undecided ones;
+        otherwise step through every pair in sort order."""
         n = len(self.cz_order)
+        if n == 0:
+            return
+        if not getattr(self, "skip_qcd", True):
+            self.show_idx = (self.show_idx + direction) % n
+            self._refresh_pair()
+            return
         for step in range(1, n + 1):
             idx = (self.show_idx + direction * step) % n
             if self.cz_order[idx] not in self.labels_state:
@@ -1850,8 +1889,11 @@ class QCApp(QtWidgets.QMainWindow):
         print("[notify]", msg)
 
     def _update_savepath_label(self):
-        if hasattr(self, "lbl_savepath"):
-            self.lbl_savepath.setText(f"Saving QC labels to:\n{self.labels_path}")
+        if hasattr(self, "savepath_edit"):
+            p = str(self.labels_path)
+            self.savepath_edit.setText(p)
+            self.savepath_edit.setToolTip(p)
+            self.savepath_edit.setCursorPosition(len(p))  # show the filename end first
 
     def _dump_labels_to(self, path):
         """Write the current QC state as a fresh labels CSV (snapshot)."""
@@ -1963,6 +2005,23 @@ class QCApp(QtWidgets.QMainWindow):
         self._notify(f"labeled cz{self.cur_cz_id}: {label}   (QC'd: {len(self.labels_state)})",
                      kind=nk)
         self._draw_match_overlay()  # marker-only refresh (no costly contour re-extract)
+        # "matched roi visible" on an unmatched ROI -> the true HCR cell IS present, so
+        # jump into add-match mode with this CZ pre-selected; the user just clicks the HCR.
+        if label == "matched roi visible":
+            self._start_manual_link_for_current()
+
+    def _start_manual_link_for_current(self):
+        """Enable add-match mode (if needed) and pre-select the current CZ ROI so the
+        operator can immediately click its HCR cell to link the pair."""
+        cz = self.cur_cz_id
+        if not self.add_match_mode:
+            self.chk_add_match.setChecked(True)   # triggers _toggle_add_match
+        self.pending_cz_id = cz
+        self.pending_hcr_id = None
+        self._set_match_status(f"cz_id={cz} selected — click its HCR cell to link "
+                               f"(Enter to add).")
+        self._update_match_buttons()
+        self._redraw_contours_only()
 
     def _accept_pair_label(self, cz_id):
         """Accept a matched pair (label 'good'), for batch-click; no current-ROI state."""
@@ -1985,6 +2044,7 @@ class QCApp(QtWidgets.QMainWindow):
 
     def _qcd_color(self, lab):
         return {"good": (40, 200, 40), "bad": (220, 60, 60), "unsure": (200, 180, 40),
+                "manual": (0, 190, 210),
                 "matched roi visible": (40, 200, 40),
                 "matched roi not visible": (220, 140, 0)}.get(lab)
 
