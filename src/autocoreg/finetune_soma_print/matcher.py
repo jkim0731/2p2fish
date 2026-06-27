@@ -13,7 +13,7 @@ Design decisions from step3_v3_spec_2026-06-01.md:
 Optional Stage-2 anchor-restricted addendum (--anchor_restricted):
   • After Stage-1 (the chosen --gate) converges, if |accepted| >= ANCHOR_RESTRICTED_N_ANCHORS,
     run a Stage-2 that rebuilds each CZ cell's descriptor from the n nearest accepted
-    anchor pairs (Wang 2015 anchor-restricted approach).
+    anchor pairs (anchor-restricted approach; descriptor per finetune_soma_print.descriptor).
   • Stage-2 uses the same R_CAND_UM=150 radius for candidates (not mutual KNN)
     and the same anchor_vote gate (ANCHOR_VOTE_FRAC=3/5).
   • Stage-2 writes to outputs/<gate>[_noLF]_anchor_restricted/<sid>/.

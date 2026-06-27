@@ -356,7 +356,7 @@ class QCApp(QtWidgets.QMainWindow):
         ))
         # Snapshot the matcher's original mapping so add-match overrides can be undone.
         self._auto_cz_to_hcr = dict(self.cz_to_hcr)
-        # Per-pair soma-print score (G2): the production Wang final CSV has no
+        # Per-pair soma-print score (G2): the production anchor-restricted final CSV has no
         # soma_score column, so load/compute final_pairs.csv (cz_id,hcr_id,soma_score)
         # — soma is a DISTANCE, lower = better match.  cz_to_soma drives the queue sort.
         self.cz_to_soma = self._load_soma_scores(qc_dir, matches_csv)
