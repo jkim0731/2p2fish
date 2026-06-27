@@ -61,7 +61,7 @@ from .run_step3_iterative import (
     anchor_vote, fit_tps, apply_tps,
     soma_score_with_neighbour_indices,
 )
-from .soma_print import cell_vectors
+from .soma_print import cell_vectors, score_pair
 
 # Matcher output root. Env-overridable; NEVER defaults to /tmp or / (storage rule).
 OUT_BASE = Path(os.environ.get("MFISH_MATCHER_OUT_BASE", "/scratch/autocoreg_outputs/matches"))
@@ -520,6 +520,16 @@ def run_subject(
     sid_out = out_dir / sid
     sid_out.mkdir(parents=True, exist_ok=True)
 
+    # Locked-prior-frame soma descriptors, computed once.  The per-pair score written
+    # to every matches CSV (`soma_score`) is this LP-frame value (radius-free
+    # score_pair) — a stable per-pair confidence (lower = better) that the QC app reads
+    # directly.  NOT the per-round warped D, which collapses to ~0 as the TPS converges.
+    _cz_vecs_lp = cell_vectors(cz_zyx_lp, m=SOMA_M_CZ)
+    _hcr_vecs_all = cell_vectors(hcr_zyx, m=SOMA_M_HCR)
+
+    def _lp_soma(i: int, j: int) -> float:
+        return float(score_pair(_cz_vecs_lp[i], _hcr_vecs_all[j], n=SOMA_N))
+
     # NCC gate needs image volumes — load once before the round loop.
     pathb_ctx = None
     if gate == "ncc":
@@ -649,7 +659,7 @@ def run_subject(
                 hcr_z=float(hcr_zyx[j, 0]),
                 hcr_y=float(hcr_zyx[j, 1]),
                 hcr_x=float(hcr_zyx[j, 2]),
-                soma_score=float(D[i, j]),
+                soma_score=_lp_soma(i, j),
                 is_gt=int(coreg_lookup.get(cz_id) == hcr_id),
             ))
         pd.DataFrame(rd_rows).to_csv(sid_out / f"matches_round{rd}.csv", index=False)
@@ -774,6 +784,7 @@ def run_subject(
                     w_rd_rows.append(dict(
                         sid=sid, round=w_rd,
                         cz_id=cz_id, hcr_id=hcr_id,
+                        soma_score=_lp_soma(i, j),
                         is_gt=int(coreg_lookup.get(cz_id) == hcr_id),
                     ))
                 pd.DataFrame(w_rd_rows).to_csv(

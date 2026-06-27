@@ -593,10 +593,16 @@ class QCApp(QtWidgets.QMainWindow):
 
     # ---------------- soma scores + review queue (G3) ----------------
     def _load_soma_scores(self, qc_dir, matches_csv) -> dict:
-        """Resolve {cz_id: soma_score}.  Order: --final-pairs; else
-        <qc_dir>/final_pairs.csv; else compute via score_final_pairs and cache there.
-        Soma is a DISTANCE (lower = better).  Falls back to NaN (matcher-order queue)
-        if scoring is unavailable."""
+        """Resolve {cz_id: soma_score}.  Order: (1) the matcher's own ``soma_score``
+        column if present (written during autocoreg — no recompute); else (2)
+        --final-pairs / <qc_dir>/final_pairs.csv; else (3) compute via score_final_pairs.
+        Soma is a DISTANCE (lower = better)."""
+        if "soma_score" in self.df_matches.columns:
+            soma = {int(c): float(s) for c, s in
+                    zip(self.df_matches["cz_id"], self.df_matches["soma_score"])}
+            n_fin = int(np.isfinite(np.fromiter(soma.values(), dtype=float)).sum())
+            print(f"[qt] soma scores from matcher CSV ({n_fin} finite / {len(soma)})")
+            return soma
         fp = Path(self.final_pairs_path) if self.final_pairs_path else (qc_dir / "final_pairs.csv")
         if not fp.exists():
             try:
