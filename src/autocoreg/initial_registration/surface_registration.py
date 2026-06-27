@@ -57,30 +57,19 @@ import pandas as pd
 from scipy.ndimage import affine_transform
 
 # Helpers vendored from session 08 — now in-package.
-from .compare_binarization import variant_watershed
-from .register_binary import (
-    cz_binary_top_mip,
-    hcr488_top_mip,
-    stage1_rigid,
-    stage2_affine,
-    warm_start_cz_binary,
-)
+from autocoreg.initial_registration.binarize import variant_watershed
+from autocoreg.initial_registration.register_2d import cz_binary_top_mip, hcr488_top_mip, stage1_rigid, stage2_affine, warm_start_cz_binary
 # NOTE: get_sxy_with_fallback (from register_binary) is intentionally NOT imported
 # here. compute_surface_registration now uses estimate_sxy_min_rule from
 # roi_area_sxy (PROMOTED 2026-06-04) — GT-free, min-rule 2× ¼-FOV; it recovers
 # thin-HCR 782149 where the old full-span/slab-auto estimators collapsed.  The
 # old fallback had a landmark_gt_fallback that was a GT-leak for 782149 (see
 # project_782149_sxy_gt_leak memory).
-from .register_nonrigid_variants import (
-    nonrigid_piecewise_rigid,
-)
+from autocoreg.initial_registration.register_nonrigid import nonrigid_piecewise_rigid
 
-from .surfaces_iter08 import (
-    get_cz_surface_iter08,
-    get_hcr_top_surface_iter07,
-)
+from autocoreg.initial_registration.surfaces import get_cz_surface_iter08, get_hcr_top_surface_iter07
 
-from . import config as _config
+from autocoreg import config as _config
 CACHE_DIR = _config.SURFACE_REGISTRATION_CACHE_DIR
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -222,7 +211,7 @@ def compute_surface_registration(
         # at this sxy: grid-search the base sxy at roi_area_sxy.SXY_GRID_SEARCH_OFFSETS
         # and pick the pose that lands (highest soma-print mutual-best / lowest
         # rigid off-centre). GT-free.
-        from .roi_area_sxy import estimate_sxy_min_rule
+        from autocoreg.initial_registration.lateral_scale import estimate_sxy_min_rule
         sxy = float(estimate_sxy_min_rule(sid)["sxy_median"])
         sxy_source = sxy_source or "min_rule_2x_quarterfov"
 
@@ -483,7 +472,7 @@ SUBJECTS_DEFAULT = ("755252", "767018", "767022", "782149", "788406", "790322")
 
 
 def build_main_registration_store(subjects=SUBJECTS_DEFAULT):
-    from .benchmark_data_loader import load_subject  # type: ignore
+    from autocoreg.io.subjects import load_subject
     rows = []
     for sid in subjects:
         print(f"=== {sid} ===", flush=True)

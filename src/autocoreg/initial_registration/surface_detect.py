@@ -61,22 +61,15 @@ else:
         _surface_z=None,
     )
 
-from .benchmark_analysis import (
-    estimate_pia_surface_image_autoselect,
-    estimate_pia_surface_image_ceiling,
-    estimate_pia_surface_quantile_ceiling,
-    list_hcr_channels,
-    load_hcr_combined,
-    load_hcr_volume,
-)
-from .benchmark_data_loader import hcr_px_to_um, load_subject
+from autocoreg.io.hcr_image import estimate_pia_surface_image_autoselect, estimate_pia_surface_image_ceiling, estimate_pia_surface_quantile_ceiling, list_hcr_channels, load_hcr_combined, load_hcr_volume
+from autocoreg.io.subjects import hcr_px_to_um, load_subject
 
 HCR = ["755252", "767018", "767022", "782149", "788406", "790322"]
 N_SIDE = 20
 EDGE_FRAC = 0.15
 
-OUT_DATA = Path("/tmp")
-OUT_FIG = Path("/tmp")
+OUT_DATA = Path("/scratch/autocoreg_outputs/dev")
+OUT_FIG = Path("/scratch/autocoreg_outputs/dev")
 
 EPS = 1e-3
 SMOOTH_Z_UM = 5.0

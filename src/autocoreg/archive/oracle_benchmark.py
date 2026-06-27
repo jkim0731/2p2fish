@@ -44,16 +44,12 @@ from scipy.interpolate import Rbf
 from scipy.spatial import cKDTree
 from sklearn.metrics import roc_auc_score
 
-from .data import (
-    BENCHMARK_SUBJECTS, argmax_ok_ids, load_sz_pins, strict_gfp_ids, subject_inputs,
-)
-from .soma_print import cell_vectors, score_many_to_many as soma_score_many
-from .shape_context import (
-    build_histograms, score_dense_gt_to_pool,
-)
-from .surfaces_iter08 import get_hcr_top_surface_iter07
+from autocoreg.io.inputs import BENCHMARK_SUBJECTS, argmax_ok_ids, load_sz_pins, strict_gfp_ids, subject_inputs
+from autocoreg.finetune_soma_print.descriptor import cell_vectors, score_many_to_many as soma_score_many
+from autocoreg.archive.shape_context import build_histograms, score_dense_gt_to_pool
+from autocoreg.initial_registration.surfaces import get_hcr_top_surface_iter07
 
-OUT_DIR = Path("/tmp/autocoreg_outputs")
+OUT_DIR = Path("/scratch/autocoreg_outputs")
 
 EXPAND_UM = 30.0
 NEAR_MISS_RADII = (30.0, 50.0, 100.0)

@@ -56,7 +56,7 @@ DEFAULT_GFP_TARGET_FRAC = 0.20  # retained for the legacy 'fixed_frac' method
 DEFAULT_GFP_INTENSITY_METHOD = "peakgauss3_mean_bg_p1"
 
 
-from . import config as _config  # noqa: E402
+from autocoreg import config as _config
 DATA_DIR = _config.DATA_ROOT
 
 # CZ side resolution (um/pixel). All current benchmark subjects use 400 um FOV / 512 px = 0.78125.

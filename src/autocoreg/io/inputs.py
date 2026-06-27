@@ -19,12 +19,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import config as _config
-from .benchmark_data_loader import load_subject
-from .centroid_helpers import centroids_um
-from .locked_prior_warm import apply_to_cz_um, compute_locked_prior_warm_start
-from .overlap_crop import get_overlap_crop
-from .surfaces_iter08 import get_hcr_top_surface_iter07
+from autocoreg import config as _config
+from autocoreg.io.subjects import load_subject
+from autocoreg.io.centroids import centroids_um
+from autocoreg.initial_registration.locked_prior import apply_to_cz_um, compute_locked_prior_warm_start
+from autocoreg.initial_registration.overlap_crop import get_overlap_crop
+from autocoreg.initial_registration.surfaces import get_hcr_top_surface_iter07
 
 BENCHMARK_SUBJECTS = ("755252", "767018", "767022", "782149", "788406", "790322")
 
@@ -53,7 +53,7 @@ def strict_gfp_ids(sid: str) -> tuple[set[int], dict]:
                 df["density"] = df["counts"] / df["volume"]
             tbl = df[["hcr_id", "density"]].dropna()
         else:
-            from .benchmark_data_loader import _aggregate_spots_from_hcr
+            from autocoreg.io.subjects import _aggregate_spots_from_hcr
             agg = _aggregate_spots_from_hcr(Path(s.hcr_dir))
             tbl = agg[["hcr_id", "density"]].dropna()
         keep = tbl[tbl["density"].astype(float) >= cutoff]
@@ -152,7 +152,7 @@ def subject_inputs(sid: str, sz_pins: dict[str, float] | None = None) -> Subject
     else:
         # GT-free path: use sz_estimator to compute sz from image data.
         # get_sz returns a dict; sz_best is the peak (== validation table sz_peak).
-        from .sz_estimator import get_sz
+        from autocoreg.initial_registration.axial_scale import get_sz
         sz_pin = float(get_sz(s)["sz_best"])
     lp = compute_locked_prior_warm_start(s, sz_init=sz_pin)
     cz_lp = apply_to_cz_um(lp, cz_um)

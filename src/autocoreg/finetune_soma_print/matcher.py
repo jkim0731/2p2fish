@@ -1,42 +1,42 @@
 """Step 3 v3 — Decluttered geometric matcher.
 
-Three primary gates compared one at a time: lr / anchor_vote / ncc.
+Three primary gates compared one at a time: likelihood_ratio / anchor_vote / ncc.
 
 Design decisions from step3_v3_spec_2026-06-01.md:
   • Fixed R_CAND_UM=150 every round (radius re-centres on TPS-warped CZ).
   • One primary gate per run, applied identically every round.
   • local_flow is round-0-ONLY pre-filter, toggled by --local_flow_rd0 (default ON).
   • Mutual-best ON every round.
-  • No Stage 2 / wang_addendum by default.
+  • No Stage 2 / anchor_restricted by default.
   • Re-evaluation each round (no locking).
 
-Optional Stage-2 Wang addendum (--wang_addendum):
-  • After Stage-1 (the chosen --gate) converges, if |accepted| >= WANG_N_ANCHORS,
+Optional Stage-2 anchor-restricted addendum (--anchor_restricted):
+  • After Stage-1 (the chosen --gate) converges, if |accepted| >= ANCHOR_RESTRICTED_N_ANCHORS,
     run a Stage-2 that rebuilds each CZ cell's descriptor from the n nearest accepted
     anchor pairs (Wang 2015 anchor-restricted approach).
   • Stage-2 uses the same R_CAND_UM=150 radius for candidates (not mutual KNN)
     and the same anchor_vote gate (ANCHOR_VOTE_FRAC=3/5).
-  • Stage-2 writes to outputs/step3_v3_<gate>[_noLF]_wang_end/<sid>/.
-  • Production defaults are UNCHANGED; --wang_addendum is opt-in only.
+  • Stage-2 writes to outputs/<gate>[_noLF]_anchor_restricted/<sid>/.
+  • Production defaults are UNCHANGED; --anchor_restricted is opt-in only.
 
 Usage:
-  python run_step3_v3.py --gate {lr,anchor_vote,ncc} [--no_local_flow_rd0] [--sids SID ...]
-  python run_step3_v3.py --gate anchor_vote --wang_addendum --sids 755252 767022 788406 790322
+  python python -m autocoreg.finetune_soma_print.matcher --gate {likelihood_ratio,anchor_vote,ncc} [--no_local_flow_rd0] [--sids SID ...]
+  python python -m autocoreg.finetune_soma_print.matcher --gate anchor_vote --anchor_restricted --sids 755252 767022 788406 790322
 
 Outputs (Stage-1 only):
-  outputs/step3_v3_<gate>[_noLF]/<sid>/
+  outputs/<gate>[_noLF]/<sid>/
     matches_round{0..T}.csv
     rounds_log.csv
     tps_warp_final.pkl
     local_flow_rd0_dropped.csv
     mb_rejection_log.csv
     pair_trajectory.csv
-  outputs/step3_v3_<gate>[_noLF]/summary.csv
+  outputs/<gate>[_noLF]/summary.csv
 
-Outputs (--wang_addendum, Stage-2):
-  outputs/step3_v3_<gate>[_noLF]_wang_end/<sid>/
-    (same files as Stage-1, plus wang_stage2_rounds_log.csv)
-  outputs/step3_v3_<gate>[_noLF]_wang_end/summary.csv
+Outputs (--anchor_restricted, Stage-2):
+  outputs/<gate>[_noLF]_anchor_restricted/<sid>/
+    (same files as Stage-1, plus anchor_restricted_rounds_log.csv)
+  outputs/<gate>[_noLF]_anchor_restricted/summary.csv
 """
 from __future__ import annotations
 
@@ -54,14 +54,11 @@ from scipy.spatial import cKDTree
 from scipy.stats import norm
 from sklearn.mixture import GaussianMixture
 
-from .data import BENCHMARK_SUBJECTS, load_sz_pins, scoring_gt
-from .run_step2_locked import _score_soma_per_gt
-from .run_step2p5_refined import prepare_subject
-from .run_step3_iterative import (
-    anchor_vote, fit_tps, apply_tps,
-    soma_score_with_neighbour_indices,
-)
-from .soma_print import cell_vectors, score_pair
+from autocoreg.io.inputs import BENCHMARK_SUBJECTS, load_sz_pins, scoring_gt
+from autocoreg.finetune_soma_print.scoring import _score_soma_per_gt
+from autocoreg.finetune_soma_print.pool_prep import prepare_subject
+from autocoreg.finetune_soma_print.tps import anchor_vote, fit_tps, apply_tps, soma_score_with_neighbour_indices
+from autocoreg.finetune_soma_print.descriptor import cell_vectors, score_pair
 
 # Matcher output root. Env-overridable; NEVER defaults to /tmp or / (storage rule).
 OUT_BASE = Path(os.environ.get("MFISH_MATCHER_OUT_BASE", "/scratch/autocoreg_outputs/matches"))
@@ -90,7 +87,7 @@ LOCAL_FLOW_K = 15
 LOCAL_FLOW_QUANTILE = 0.90
 
 # Primary gate: LR
-LR_THRESHOLD = 0.05
+LIKELIHOOD_RATIO_THRESHOLD = 0.05
 
 # Primary gate: anchor_vote
 # 0.6 = 3/5 — relaxed from the cross-round 5/5 (1.0) per spec §3 note.
@@ -112,9 +109,9 @@ NCC_DELTA_THRESHOLD = -0.05
 # copy them. Default leaves headroom if several subjects run concurrently.
 NCC_WORKERS = min(8, max(1, (os.cpu_count() or 4) - 2))
 
-# Stage-2 Wang anchor-restricted descriptor (--wang_addendum only)
-# Matches v2's WANG_N_ANCHORS=10; centroid-only, no images.
-WANG_N_ANCHORS = 10
+# Stage-2 anchor-restricted descriptor (--anchor_restricted only)
+# Matches v2's ANCHOR_RESTRICTED_N_ANCHORS=10; centroid-only, no images.
+ANCHOR_RESTRICTED_N_ANCHORS = 10
 
 
 # ── Scoring helpers ────────────────────────────────────────────────────────────
@@ -166,13 +163,13 @@ def soma_score_radius(
     return D
 
 
-def wang_anchor_score_radius(
+def anchor_restricted_score_radius(
     cz_cur: np.ndarray, hcr_zyx: np.ndarray,
     accepted: set[tuple[int, int]],
     R_cand: float,
-    n_anchors: int = WANG_N_ANCHORS,
+    n_anchors: int = ANCHOR_RESTRICTED_N_ANCHORS,
 ) -> np.ndarray:
-    """Wang anchor-restricted descriptor, radius-candidate version for v3.
+    """anchor-restricted descriptor, radius-candidate version for v3.
 
     For each CZ cell i:
       • Find the n_anchors nearest CZ cells that are in `accepted` (Euclidean in
@@ -271,10 +268,10 @@ def local_flow_filter(
     return kept, devs
 
 
-def lr_filter(
+def likelihood_ratio_filter(
     mb_pairs: list[tuple[int, int]],
     D: np.ndarray,
-    threshold: float = LR_THRESHOLD,
+    threshold: float = LIKELIHOOD_RATIO_THRESHOLD,
 ) -> tuple[list[tuple[int, int]], np.ndarray]:
     """Fit 2-component GMM on per-CZ best scores; 1-component on 2nd-best.
     Keep pairs with likelihood ratio LR(incorrect/correct) < threshold."""
@@ -303,14 +300,14 @@ def lr_filter(
     sd_corr = float(sd_best[correct_idx])
     mu_inc = float(gmm_2nd.means_.ravel()[0])
     sd_inc = float(np.sqrt(gmm_2nd.covariances_.ravel()[0]))
-    lr_vals = np.empty(len(mb_pairs))
+    lratio_vals = np.empty(len(mb_pairs))
     for k_, (i, j) in enumerate(mb_pairs):
         s = float(D[i, j])
         p_inc = norm.pdf(s, loc=mu_inc, scale=sd_inc)
         p_cor = norm.pdf(s, loc=mu_corr, scale=sd_corr)
-        lr_vals[k_] = p_inc / (p_cor + 1e-30)
-    kept = [mb_pairs[k_] for k_, lr in enumerate(lr_vals) if lr < threshold]
-    return kept, lr_vals
+        lratio_vals[k_] = p_inc / (p_cor + 1e-30)
+    kept = [mb_pairs[k_] for k_, ratio in enumerate(lratio_vals) if ratio < threshold]
+    return kept, lratio_vals
 
 
 def anchor_vote_gate(
@@ -357,7 +354,7 @@ _NCC_CTX = None
 
 def _ncc_one_pair(pair):
     """Worker: compute LOO-δ for one pair using the forked-in _NCC_CTX."""
-    from .loo_image_ncc import loo_delta_ncc
+    from autocoreg.finetune_soma_print.loo_image_ncc import loo_delta_ncc
     g = _NCC_CTX
     return loo_delta_ncc(
         pair, g["anchor_pool"],
@@ -385,7 +382,7 @@ def ncc_gate(
     given the shared read-only volumes). ``n_workers`` defaults to NCC_WORKERS;
     set to 1 for the sequential path (identical results, used as fallback).
     """
-    from .loo_image_ncc import loo_delta_ncc
+    from autocoreg.finetune_soma_print.loo_image_ncc import loo_delta_ncc
 
     if len(mb_pairs) == 0:
         return [], []
@@ -445,9 +442,9 @@ def ncc_gate(
 
 def _build_pathb_ctx(inp, cz_pool_ids: np.ndarray) -> dict:
     """Load HCR 488, CZ z-stack, and pia surface for the NCC gate."""
-    from .benchmark_analysis import load_hcr_volume
-    from .cz_volume import load_cz_volume
-    from .surfaces_iter08 import get_hcr_top_surface_iter07
+    from autocoreg.io.hcr_image import load_hcr_volume
+    from autocoreg.io.cz_volume import load_cz_volume
+    from autocoreg.initial_registration.surfaces import get_hcr_top_surface_iter07
     t0 = time.time()
     print("  loading HCR 488 (level 3) for NCC gate ...", flush=True)
     vol, xy_um, z_um = load_hcr_volume(inp.s, channel="488", level=3)
@@ -494,9 +491,9 @@ def run_subject(
     use_local_flow_rd0: bool,
     out_dir: Path,
     anchor_vote_frac: float = ANCHOR_VOTE_FRAC,
-    wang_addendum: bool = False,
+    anchor_restricted: bool = False,
 ) -> dict:
-    label = gate + ("" if use_local_flow_rd0 else "_noLF") + ("+wang_end" if wang_addendum else "")
+    label = gate + ("" if use_local_flow_rd0 else "_noLF") + ("+anchor_restricted" if anchor_restricted else "")
     print(f"\n=== {sid} [gate={gate}  local_flow_rd0={use_local_flow_rd0}] ===",
           flush=True)
     t_subj = time.time()
@@ -603,8 +600,8 @@ def run_subject(
 
         # ── Primary gate ──────────────────────────────────────────────────────
         n_before_gate = len(base_pairs)
-        if gate == "lr":
-            kept, _ = lr_filter(base_pairs, D)
+        if gate == "likelihood_ratio":
+            kept, _ = likelihood_ratio_filter(base_pairs, D)
         elif gate == "anchor_vote":
             kept, _ = anchor_vote_gate(base_pairs, cz_cur, hcr_zyx,
                                        frac_threshold=anchor_vote_frac)
@@ -711,43 +708,43 @@ def run_subject(
             print(f"  ABORT: |accepted|={len(accepted)} < {MIN_LANDMARKS_FOR_ABORT}")
             break
 
-    # ── Stage-2 Wang anchor-restricted descriptor (--wang_addendum only) ─────
+    # ── Stage-2 anchor-restricted descriptor (--anchor_restricted only) ─────
     # Starts from Stage-1's converged accepted set + current TPS-warped cz_cur.
     # Uses the same anchor_vote gate (ANCHOR_VOTE_FRAC=3/5) and R_CAND_UM=150.
     # Stage-1 files are written to out_dir (already done above via per-round CSVs).
-    # Stage-2 results are written to a separate _wang_end output dir.
-    wang2_rounds_log: list[dict] = []
-    if wang_addendum:
-        if len(accepted) < WANG_N_ANCHORS:
+    # Stage-2 results are written to a separate _anchor_restricted output dir.
+    ar_rounds_log: list[dict] = []
+    if anchor_restricted:
+        if len(accepted) < ANCHOR_RESTRICTED_N_ANCHORS:
             print(
-                f"  Wang Stage-2 SKIPPED: |accepted|={len(accepted)} < "
-                f"{WANG_N_ANCHORS} anchors needed; returning Stage-1 result.",
+                f"  Anchor-restricted Stage-2 SKIPPED: |accepted|={len(accepted)} < "
+                f"{ANCHOR_RESTRICTED_N_ANCHORS} anchors needed; returning Stage-1 result.",
                 flush=True,
             )
         else:
             print(
-                f"\n  -- Wang Stage-2 start: {len(accepted)} Stage-1 anchors --",
+                f"\n  -- Anchor-restricted Stage-2 start: {len(accepted)} Stage-1 anchors --",
                 flush=True,
             )
             # Stage-2 operates on the same coordinate arrays (cz_zyx_lp, hcr_zyx).
             # cz_cur is already TPS-warped to the Stage-1 final state.
-            wang_accepted: set[tuple[int, int]] = set(accepted)
-            wang_tps = tps  # carry Stage-1 TPS forward
+            ar_accepted: set[tuple[int, int]] = set(accepted)
+            ar_tps = tps  # carry Stage-1 TPS forward
             for w_rd in range(MAX_ROUNDS):
                 t_wrd = time.time()
-                # Re-warp from Stage-1 baseline LP frame using the current wang_tps.
-                if wang_tps is not None:
-                    cz_cur = apply_tps(wang_tps, cz_zyx_lp)
+                # Re-warp from Stage-1 baseline LP frame using the current ar_tps.
+                if ar_tps is not None:
+                    cz_cur = apply_tps(ar_tps, cz_zyx_lp)
 
-                # Wang anchor-restricted descriptor, radius candidates.
-                D_wang = wang_anchor_score_radius(
+                # anchor-restricted descriptor, radius candidates.
+                D_ar = anchor_restricted_score_radius(
                     cz_cur, hcr_zyx,
-                    accepted=wang_accepted,
+                    accepted=ar_accepted,
                     R_cand=R_CAND_UM,
-                    n_anchors=WANG_N_ANCHORS,
+                    n_anchors=ANCHOR_RESTRICTED_N_ANCHORS,
                 )
-                # Mutual-best on the Wang score matrix.
-                w_mb_set, _, _ = mutual_best_pairs_from_D(D_wang)
+                # Mutual-best on the anchor-restricted score matrix.
+                w_mb_set, _, _ = mutual_best_pairs_from_D(D_ar)
                 w_base = list(w_mb_set)
 
                 # Same anchor_vote gate (within-round 3/5).
@@ -757,28 +754,28 @@ def run_subject(
                 )
 
                 # Re-evaluate (no locking).
-                w_prev = wang_accepted
-                wang_accepted = set(w_kept)
-                w_added = len(wang_accepted - w_prev)
-                w_removed = len(w_prev - wang_accepted)
+                w_prev = ar_accepted
+                ar_accepted = set(w_kept)
+                w_added = len(ar_accepted - w_prev)
+                w_removed = len(w_prev - ar_accepted)
                 w_rel_delta = (w_added + w_removed) / max(len(w_prev), 1)
                 # in-pool GT count for per-round logging only (not the scoring denominator)
                 w_n_gt = sum(
-                    1 for (i, j) in wang_accepted
+                    1 for (i, j) in ar_accepted
                     if coreg_lookup.get(int(cz_pool_ids[i])) == int(hcr_pool_ids[j])
                 )
 
                 # Refit TPS on Stage-2 accepted set.
-                if len(wang_accepted) >= 4:
-                    w_src = np.array([cz_zyx_lp[i] for (i, _) in wang_accepted])
-                    w_dst = np.array([hcr_zyx[j] for (_, j) in wang_accepted])
-                    wang_tps = fit_tps(w_src, w_dst)
+                if len(ar_accepted) >= 4:
+                    w_src = np.array([cz_zyx_lp[i] for (i, _) in ar_accepted])
+                    w_dst = np.array([hcr_zyx[j] for (_, j) in ar_accepted])
+                    ar_tps = fit_tps(w_src, w_dst)
                 else:
-                    wang_tps = None
+                    ar_tps = None
 
-                # Per-round CSV for Stage-2 (named matches_wang_round{w_rd}.csv).
+                # Per-round CSV for Stage-2 (named matches_anchor_restricted_round{w_rd}.csv).
                 w_rd_rows = []
-                for (i, j) in wang_accepted:
+                for (i, j) in ar_accepted:
                     cz_id = int(cz_pool_ids[i])
                     hcr_id = int(hcr_pool_ids[j])
                     w_rd_rows.append(dict(
@@ -788,14 +785,14 @@ def run_subject(
                         is_gt=int(coreg_lookup.get(cz_id) == hcr_id),
                     ))
                 pd.DataFrame(w_rd_rows).to_csv(
-                    sid_out / f"matches_wang_round{w_rd}.csv", index=False
+                    sid_out / f"matches_anchor_restricted_round{w_rd}.csv", index=False
                 )
 
-                wang2_rounds_log.append(dict(
-                    stage="wang2", round=w_rd,
+                ar_rounds_log.append(dict(
+                    stage="anchor_restricted", round=w_rd,
                     n_mb=len(w_mb_set),
                     n_before_gate=len(w_base),
-                    n_accepted=len(wang_accepted),
+                    n_accepted=len(ar_accepted),
                     n_gt=w_n_gt,
                     n_added=w_added,
                     n_removed=w_removed,
@@ -803,27 +800,27 @@ def run_subject(
                     elapsed_s=round(time.time() - t_wrd, 1),
                 ))
                 print(
-                    f"  wang2 rd{w_rd}: |MB|={len(w_mb_set)}"
+                    f"  anchor_restricted rd{w_rd}: |MB|={len(w_mb_set)}"
                     f"  gate_kept={len(w_kept)}/{len(w_base)}"
-                    f"  |accepted|={len(wang_accepted)} (+{w_added}/-{w_removed})"
+                    f"  |accepted|={len(ar_accepted)} (+{w_added}/-{w_removed})"
                     f"  GT={w_n_gt}  Δ_rel={w_rel_delta:.3f}"
                     f"  [{time.time()-t_wrd:.1f}s]",
                     flush=True,
                 )
                 if w_rd > 0 and w_rel_delta < CONVERGE_REL_DELTA:
-                    print(f"  Wang Stage-2 converged after round {w_rd}")
+                    print(f"  Anchor-restricted Stage-2 converged after round {w_rd}")
                     break
-                if len(wang_accepted) < MIN_LANDMARKS_FOR_ABORT:
+                if len(ar_accepted) < MIN_LANDMARKS_FOR_ABORT:
                     print(
-                        f"  Wang Stage-2 ABORT: |accepted|={len(wang_accepted)}"
+                        f"  Anchor-restricted Stage-2 ABORT: |accepted|={len(ar_accepted)}"
                         f" < {MIN_LANDMARKS_FOR_ABORT}"
                     )
                     break
 
-            # Promote Wang Stage-2 result: overwrite accepted, cz_cur, tps for
+            # Promote Anchor-restricted Stage-2 result: overwrite accepted, cz_cur, tps for
             # final output and return value.
-            accepted = wang_accepted
-            tps = wang_tps
+            accepted = ar_accepted
+            tps = ar_tps
 
     # ── Persist TPS ───────────────────────────────────────────────────────────
     if tps is not None:
@@ -832,9 +829,9 @@ def run_subject(
 
     # ── Persist rounds log ─────────────────────────────────────────────────────
     pd.DataFrame(rounds_log).to_csv(sid_out / "rounds_log.csv", index=False)
-    if wang2_rounds_log:
-        pd.DataFrame(wang2_rounds_log).to_csv(
-            sid_out / "wang_stage2_rounds_log.csv", index=False
+    if ar_rounds_log:
+        pd.DataFrame(ar_rounds_log).to_csv(
+            sid_out / "anchor_restricted_rounds_log.csv", index=False
         )
 
     # ── Persist local_flow round-0 drop log ───────────────────────────────────
@@ -899,8 +896,8 @@ def run_subject(
         ))
     pd.DataFrame(traj_rows).to_csv(sid_out / "pair_trajectory.csv", index=False)
 
-    # Use Stage-2 final state if the Wang addendum ran; Stage-1 otherwise.
-    if wang2_rounds_log:
+    # Use Stage-2 final state if the anchor-restricted addendum ran; Stage-1 otherwise.
+    if ar_rounds_log:
         final_accepted_count = len(accepted)
         # in-pool GT count (for in-round logging only; NOT the scoring denominator)
         final_gt_inpool = sum(
@@ -942,7 +939,7 @@ def run_subject(
     )
     return dict(
         sid=sid, gate=label, local_flow_rd0=int(use_local_flow_rd0),
-        n_rounds=len(rounds_log) + len(wang2_rounds_log),
+        n_rounds=len(rounds_log) + len(ar_rounds_log),
         final_matches=final_accepted_count,
         # in-pool GT fields (pose-dependent; kept for backwards compat)
         final_gt_inpool=final_gt_inpool,
@@ -963,8 +960,8 @@ def main():
     p = argparse.ArgumentParser(
         description="Step 3 v3 — decluttered geometric matcher"
     )
-    p.add_argument("--gate", choices=["lr", "anchor_vote", "ncc"], required=True,
-                   help="Primary filter gate: lr | anchor_vote | ncc")
+    p.add_argument("--gate", choices=["likelihood_ratio", "anchor_vote", "ncc"], required=True,
+                   help="Primary filter gate: likelihood_ratio | anchor_vote | ncc")
     p.add_argument("--local_flow_rd0", action="store_true", default=True,
                    help="Apply local_flow pre-filter at round 0 (default ON)")
     p.add_argument("--no_local_flow_rd0", dest="local_flow_rd0",
@@ -979,10 +976,10 @@ def main():
                    help=f"NCC gate: parallel worker processes over candidate "
                         f"pairs (default {NCC_WORKERS}; 1 = sequential). Lower "
                         f"this if running several subjects concurrently.")
-    p.add_argument("--wang_addendum", action="store_true", default=False,
-                   help="After Stage-1 converges, run a Stage-2 Wang anchor-restricted "
+    p.add_argument("--anchor_restricted", action="store_true", default=False,
+                   help="After Stage-1 converges, run a Stage-2 anchor-restricted "
                         "descriptor loop with the same gate.  Outputs go to "
-                        "outputs/step3_v3_<gate>[_noLF]_wang_end/. "
+                        "outputs/<gate>[_noLF]_anchor_restricted/. "
                         "Production defaults UNCHANGED; this flag is opt-in only.")
     args = p.parse_args()
     NCC_WORKERS = max(1, int(args.ncc_workers))
@@ -991,8 +988,8 @@ def main():
     sids = args.sids if args.sids else list(BENCHMARK_SUBJECTS)
 
     lf_suffix = "" if args.local_flow_rd0 else "_noLF"
-    wang_suffix = "_wang_end" if args.wang_addendum else ""
-    out_dir = OUT_BASE / f"step3_v3_{args.gate}{lf_suffix}{wang_suffix}"
+    ar_suffix = "_anchor_restricted" if args.anchor_restricted else ""
+    out_dir = OUT_BASE / f"{args.gate}{lf_suffix}{ar_suffix}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     summary = []
@@ -1003,7 +1000,7 @@ def main():
                 use_local_flow_rd0=args.local_flow_rd0,
                 out_dir=out_dir,
                 anchor_vote_frac=args.anchor_vote_frac,
-                wang_addendum=args.wang_addendum,
+                anchor_restricted=args.anchor_restricted,
             )
             summary.append(row)
         except Exception as exc:

@@ -47,32 +47,11 @@ import pandas as pd
 import tifffile
 
 # Vendored iter modules are now in-package.
-from .iter07_compute import (
-    EPS,
-    HUBER_K,
-    POLY_DEGREE,
-    detect_transitions,
-    fit_polysurf,
-    sampling_grid,
-)
-from .iter08_cz_prior import (
-    CZ_TARGET_Z_UM,
-    CZ_THR_FLOOR,
-    GATE_UM,
-    TRANS_FRAC_BANK,
-    _patch_log_columns,
-    fit_gated_surface,
-    load_cz_volume,
-    select_trans_frac,
-)
-from .iter08_hcr_bottom import (
-    MAD_GATE_K,
-    detect_bottom_transitions,
-    detect_top_transitions,
-    mad_gate,
-)
+from autocoreg.initial_registration.surface_detect import EPS, HUBER_K, POLY_DEGREE, detect_transitions, fit_polysurf, sampling_grid
+from autocoreg.initial_registration.cz_surface import CZ_TARGET_Z_UM, CZ_THR_FLOOR, GATE_UM, TRANS_FRAC_BANK, _patch_log_columns, fit_gated_surface, load_cz_volume, select_trans_frac
+from autocoreg.initial_registration.hcr_bottom_surface import MAD_GATE_K, detect_bottom_transitions, detect_top_transitions, mad_gate
 
-from . import config as _config
+from autocoreg import config as _config
 CACHE_DIR = _config.SURFACES_CACHE_DIR
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -169,7 +148,7 @@ def compute_cz_surface_iter08(
 # ------------------------------------------------------------
 def _load_hcr_combined(s, level: int = 4):
     # imported lazily to avoid a hard dependency when only CZ is needed
-    from .benchmark_analysis import load_hcr_combined  # type: ignore
+    from autocoreg.io.hcr_image import load_hcr_combined
     return load_hcr_combined(s, level=level)
 
 
@@ -303,7 +282,7 @@ SUBJECTS_DEFAULT = ("755252", "767018", "767022", "782149", "788406", "790322")
 def build_main_surface_store(subjects=SUBJECTS_DEFAULT, level: int = 4):
     """Compute CZ iter08 + HCR top/bottom iter07/08 surfaces for every
     benchmark subject, cache them, and write a combined summary CSV."""
-    from .benchmark_data_loader import load_subject  # type: ignore
+    from autocoreg.io.subjects import load_subject
     rows = []
     for sid in subjects:
         print(f"=== {sid} ===", flush=True)

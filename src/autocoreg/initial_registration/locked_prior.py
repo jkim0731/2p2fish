@@ -37,18 +37,10 @@ from typing import Optional
 
 import numpy as np
 
-from .benchmark_data_loader import HCR_SEG_XY_DOWNSAMPLE  # noqa: F401
-from .r1_revised import (
-    _plane_normal_from_surface,
-    _rotation_about_z_row,
-    _rotation_between_row,
-    _surface_z_at,
-)
-from .surface_registration_v2 import get_surface_registration
-from .surfaces_iter08 import (
-    get_cz_surface_iter08,
-    get_hcr_top_surface_iter07,
-)
+from autocoreg.io.subjects import HCR_SEG_XY_DOWNSAMPLE
+from autocoreg.initial_registration.coarse_align import _plane_normal_from_surface, _rotation_about_z_row, _rotation_between_row, _surface_z_at
+from autocoreg.initial_registration.surface_registration import get_surface_registration
+from autocoreg.initial_registration.surfaces import get_cz_surface_iter08, get_hcr_top_surface_iter07
 
 PRIOR_ROTATION_DEG_Z = 180.0
 
@@ -169,14 +161,14 @@ def _affine_centroid_translation_um(
 # ----------------------------------------------------------------------
 def _cz_mean_depth_um(s, src_mean_zyx_um: np.ndarray, cz_surface: dict) -> float:
     """Mean CZ centroid depth (µm) below CZ pia at the centroid mean xy."""
-    from .benchmark_analysis import depth_from_surface
+    from autocoreg.io.hcr_image import depth_from_surface
     cz_mean_xyz = src_mean_zyx_um[[2, 1, 0]]
     return float(depth_from_surface(cz_mean_xyz[None, :], cz_surface)[0])
 
 
 def _hcr_mean_depth_um(s, hcr_surface: dict) -> float:
     """Mean HCR centroid depth (µm) below HCR pia, computed per-cell."""
-    from .benchmark_analysis import depth_from_surface
+    from autocoreg.io.hcr_image import depth_from_surface
     hcr_xyz = np.column_stack([
         s.hcr_centroids["x_px"].to_numpy(float) * float(s.hcr_xy_um),
         s.hcr_centroids["y_px"].to_numpy(float) * float(s.hcr_xy_um),
@@ -376,7 +368,7 @@ def apply_to_cz_um(
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     import sys
-    from .benchmark_data_loader import BENCHMARK_SUBJECTS, load_subject
+    from autocoreg.io.subjects import BENCHMARK_SUBJECTS, load_subject
 
     sids = sys.argv[1:] or list(BENCHMARK_SUBJECTS)
     for sid in sids:

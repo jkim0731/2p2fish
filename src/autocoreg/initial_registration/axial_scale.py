@@ -37,11 +37,11 @@ from scipy.ndimage import shift as ndi_shift
 from scipy.signal import fftconvolve
 import tifffile
 
-from .benchmark_analysis import depth_from_surface, load_hcr_volume
-from .locked_prior_warm import LockedPriorWarmStart, compute_locked_prior_warm_start
-from .surface_registration_v2 import get_surface_registration
-from .surfaces_iter08 import get_cz_surface_iter08
-from . import config as _config
+from autocoreg.io.hcr_image import depth_from_surface, load_hcr_volume
+from autocoreg.initial_registration.locked_prior import LockedPriorWarmStart, compute_locked_prior_warm_start
+from autocoreg.initial_registration.surface_registration import get_surface_registration
+from autocoreg.initial_registration.surfaces import get_cz_surface_iter08
+from autocoreg import config as _config
 
 # ----------------------------------------------------------------------
 # Cache

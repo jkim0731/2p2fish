@@ -1,15 +1,15 @@
 """Minimal CLI entry point for mfish-autocoreg.
 
 Usage:
-    autocoreg run <subject_id> [--qc] [--build-qc] [--gate GATE] [--no-wang]
+    autocoreg run <subject_id> [--qc] [--build-qc] [--gate GATE] [--no-anchor-restricted]
     autocoreg run 790322 --qc
 
 Pipeline stages executed by ``run``:
-    1. Surface fitting       (surfaces_iter08)
-    2. sxy estimation        (roi_area_sxy.estimate_sxy_min_rule)
-    3. Surface registration  (surface_registration_v2)
-    4. sz estimation         (sz_estimator.get_sz)
-    5. Matcher               (run_step3_v3.run_subject)  -> matches CSVs
+    1. Surface fitting       (initial_registration.surfaces)
+    2. sxy estimation        (initial_registration.lateral_scale.estimate_sxy_min_rule)
+    3. Surface registration  (initial_registration.surface_registration)
+    4. sz estimation         (initial_registration.axial_scale.get_sz)
+    5. Matcher               (finetune_soma_print.matcher.run_subject)  -> matches CSVs
     6. QC artifacts          (qc.build_artifacts)        [if --qc or --build-qc]
     7. QC viewer             (qc.app)                    [if --qc]
 
@@ -23,25 +23,26 @@ import argparse
 import sys
 
 
-# Production matcher configuration (matches the validated
-# `step3_v3_anchor_vote_wang_end` setup).
+# Production matcher configuration (the validated
+# `anchor_vote` gate + `anchor_restricted` Stage-2 setup).
 _DEFAULT_GATE = "anchor_vote"
 
 
-def _matcher_variant(gate: str, use_local_flow_rd0: bool, wang: bool) -> str:
-    """Output-dir / QC-variant name `run_step3_v3` uses for this config."""
-    return (f"step3_v3_{gate}"
+def _matcher_variant(gate: str, use_local_flow_rd0: bool, anchor_restricted: bool) -> str:
+    """Output-dir / QC-variant name the matcher uses for this config."""
+    return (f"{gate}"
             + ("" if use_local_flow_rd0 else "_noLF")
-            + ("_wang_end" if wang else ""))
+            + ("_anchor_restricted" if anchor_restricted else ""))
 
 
 def _run(sid: str, out_dir: str | None, launch_qc: bool, *,
-         gate: str = _DEFAULT_GATE, wang: bool = True, build_qc: bool = False) -> None:
-    from .benchmark_data_loader import load_subject
-    from .surfaces_iter08 import get_cz_surface_iter08, get_hcr_top_surface_iter07
-    from .roi_area_sxy import estimate_sxy_min_rule
-    from .surface_registration_v2 import get_surface_registration
-    from .sz_estimator import get_sz
+         gate: str = _DEFAULT_GATE, anchor_restricted: bool = True,
+         build_qc: bool = False) -> None:
+    from autocoreg.io.subjects import load_subject
+    from autocoreg.initial_registration.surfaces import get_cz_surface_iter08, get_hcr_top_surface_iter07
+    from autocoreg.initial_registration.lateral_scale import estimate_sxy_min_rule
+    from autocoreg.initial_registration.surface_registration import get_surface_registration
+    from autocoreg.initial_registration.axial_scale import get_sz
 
     print(f"[autocoreg] loading subject {sid}")
     s = load_subject(sid)
@@ -67,16 +68,16 @@ def _run(sid: str, out_dir: str | None, launch_qc: bool, *,
     print(f"[autocoreg] pipeline (rough reg) complete: sxy={sxy:.4f} sz={sz:.4f}")
 
     # ---- Step 5: matcher (GT-free; sz pinned from the image estimator) ----
-    from .run_step3_v3 import run_subject, OUT_BASE
+    from autocoreg.finetune_soma_print.matcher import run_subject, OUT_BASE
     use_local_flow_rd0 = True
-    variant = _matcher_variant(gate, use_local_flow_rd0, wang)
+    variant = _matcher_variant(gate, use_local_flow_rd0, anchor_restricted)
     matcher_out = OUT_BASE / variant
     matcher_out.mkdir(parents=True, exist_ok=True)
     sz_pins = {sid: sz}
     print(f"[autocoreg] matching (gate={gate}, local_flow_rd0={use_local_flow_rd0}, "
-          f"wang_addendum={wang}) -> {matcher_out / sid}")
+          f"anchor_restricted={anchor_restricted}) -> {matcher_out / sid}")
     run_subject(sid, sz_pins, gate=gate, use_local_flow_rd0=use_local_flow_rd0,
-                out_dir=matcher_out, wang_addendum=wang)
+                out_dir=matcher_out, anchor_restricted=anchor_restricted)
 
     from .qc.build_artifacts import final_round_csv, build_qc_artifacts
     matches_csv = final_round_csv(matcher_out / sid)
@@ -84,7 +85,7 @@ def _run(sid: str, out_dir: str | None, launch_qc: bool, *,
 
     # ---- Step 6: build QC artifacts (only when needed) ----
     if launch_qc or build_qc:
-        from . import config as _config
+        from autocoreg import config as _config
         artifact_dir = _config.QC_ARTIFACT_DIR / variant / sid
         print(f"[autocoreg] building QC artifacts -> {artifact_dir}")
         build_qc_artifacts(sid, matches_csv=matches_csv, out_dir=artifact_dir,
@@ -117,17 +118,19 @@ def main() -> None:
     run_parser.add_argument("--build-qc", action="store_true",
                             help="Build QC artifacts after matching but do NOT launch the viewer")
     run_parser.add_argument("--gate", default=_DEFAULT_GATE,
-                            choices=["lr", "anchor_vote", "ncc"],
+                            choices=["likelihood_ratio", "anchor_vote", "ncc"],
                             help=f"Matcher primary gate (default {_DEFAULT_GATE})")
-    run_parser.add_argument("--no-wang", dest="wang", action="store_false",
-                            help="Disable the Stage-2 Wang anchor-restricted addendum")
+    run_parser.add_argument("--no-anchor-restricted", dest="anchor_restricted",
+                            action="store_false",
+                            help="Disable the Stage-2 anchor-restricted addendum")
     run_parser.add_argument("--out-dir", default=None, help="Output directory for results")
 
     args = parser.parse_args()
 
     if args.command == "run":
         _run(args.subject_id, args.out_dir, args.qc,
-             gate=args.gate, wang=args.wang, build_qc=args.build_qc)
+             gate=args.gate, anchor_restricted=args.anchor_restricted,
+             build_qc=args.build_qc)
     else:
         parser.print_help()
         sys.exit(1)

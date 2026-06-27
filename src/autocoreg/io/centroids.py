@@ -171,7 +171,7 @@ def default_warmstart_zyx(cz_um_zyx: np.ndarray, hcr_um_zyx: np.ndarray,
                 # the inlier@30um score no longer grows.
                 adopted_scales = None
                 try:
-                    from .benchmark_analysis import fit_anisotropic_similarity as _fas
+                    from autocoreg.io.hcr_image import fit_anisotropic_similarity as _fas
                     best_score = int((_tree.query(pred_xyz, k=1)[0] < 30.0).sum())
                     for _it in range(5):
                         d_cz2h, idx_cz2h = _tree.query(pred_xyz, k=1)
@@ -239,7 +239,7 @@ def centroids_um(s, modality: str = "cz") -> tuple[np.ndarray, np.ndarray]:
 
     ``modality`` ∈ {"cz", "hcr_gfp", "hcr_all"}.
     """
-    from .benchmark_data_loader import cz_px_to_um, hcr_px_to_um
+    from autocoreg.io.subjects import cz_px_to_um, hcr_px_to_um
 
     if modality == "cz":
         cz = s.cz_centroids

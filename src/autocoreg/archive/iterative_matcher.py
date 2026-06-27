@@ -31,17 +31,15 @@ import pandas as pd
 from scipy.interpolate import Rbf
 from scipy.spatial import cKDTree
 
-from .data import BENCHMARK_SUBJECTS, load_sz_pins, subject_inputs
-from .benchmark_analysis import load_hcr_volume
-from .cz_volume import load_cz_volume
-from .local_ncc import per_pair_local_ncc
-from .run_step2_locked import _score_soma_per_gt
-from .run_step2p5_refined import (
-    adaptive_r_cand, hcr_pia_z_over_region, z_density_intersection_bounds,
-)
-from .soma_print import cell_vectors
+from autocoreg.io.inputs import BENCHMARK_SUBJECTS, load_sz_pins, subject_inputs
+from autocoreg.io.hcr_image import load_hcr_volume
+from autocoreg.io.cz_volume import load_cz_volume
+from autocoreg.finetune_soma_print.local_ncc import per_pair_local_ncc
+from autocoreg.archive.locked_benchmark import _score_soma_per_gt
+from autocoreg.archive.refined_benchmark import adaptive_r_cand, hcr_pia_z_over_region, z_density_intersection_bounds
+from autocoreg.finetune_soma_print.descriptor import cell_vectors
 
-OUT_ROOT = Path("/tmp/autocoreg_outputs/step3")
+OUT_ROOT = Path("/scratch/autocoreg_outputs/step3")
 OUT_ROOT.mkdir(parents=True, exist_ok=True)
 
 # ----- Soma-print config (from Step 2.5 winning region) -----

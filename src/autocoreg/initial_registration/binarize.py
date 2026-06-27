@@ -29,12 +29,12 @@ from scipy.ndimage import (
 from skimage.feature import peak_local_max
 from skimage.segmentation import watershed
 
-from .benchmark_data_loader import load_subject
-from .surfaces_iter08 import get_hcr_top_surface_iter07
-from .register_binary import detect_objects_binary, hcr488_top_mip
+from autocoreg.io.subjects import load_subject
+from autocoreg.initial_registration.surfaces import get_hcr_top_surface_iter07
+from autocoreg.initial_registration.register_2d import detect_objects_binary, hcr488_top_mip
 
 HERE = Path(__file__).resolve().parent
-FIG = Path("/tmp")  # figures go to /tmp in package context (was HERE/figures)
+FIG = Path("/scratch/autocoreg_outputs/dev")  # figures go to /scratch in package context (was HERE/figures)
 SUBJECTS = ["788406", "790322", "767018", "782149", "755252", "767022"]
 
 

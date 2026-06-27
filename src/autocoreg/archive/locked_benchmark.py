@@ -23,15 +23,13 @@ import numpy as np
 import pandas as pd
 from scipy.spatial import cKDTree
 
-from .data import BENCHMARK_SUBJECTS, load_sz_pins, subject_inputs
-from .soma_print import cell_vectors
-from .shape_context import build_histograms, score_dense_gt_to_pool
-from .surfaces_iter08 import get_hcr_top_surface_iter07
-from .run_step1_oracle import (
-    EXPAND_UM, NEAR_MISS_RADII, RECALL_K, metrics_from_D,
-)
+from autocoreg.io.inputs import BENCHMARK_SUBJECTS, load_sz_pins, subject_inputs
+from autocoreg.finetune_soma_print.descriptor import cell_vectors
+from autocoreg.archive.shape_context import build_histograms, score_dense_gt_to_pool
+from autocoreg.initial_registration.surfaces import get_hcr_top_surface_iter07
+from autocoreg.archive.oracle_benchmark import EXPAND_UM, NEAR_MISS_RADII, RECALL_K, metrics_from_D
 
-OUT_DIR = Path("/tmp/autocoreg_outputs")
+OUT_DIR = Path("/scratch/autocoreg_outputs")
 
 
 # --------------------------------------------------------------------------- #

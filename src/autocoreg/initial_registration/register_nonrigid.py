@@ -38,16 +38,9 @@ try:
 except ImportError:
     sitk = types.SimpleNamespace()
 
-from .benchmark_data_loader import load_subject
-from .register_binary import (
-    cz_binary_top_mip, detect_objects_binary, get_sxy_with_fallback,
-    hcr488_top_mip, ncc_overlap, rigid_to_affine_init,
-    stage1_rigid, stage2_affine, warm_start_cz_binary,
-)
-from .surfaces_iter08 import (
-    get_cz_surface_iter08,
-    get_hcr_top_surface_iter07,
-)
+from autocoreg.io.subjects import load_subject
+from autocoreg.initial_registration.register_2d import cz_binary_top_mip, detect_objects_binary, get_sxy_with_fallback, hcr488_top_mip, ncc_overlap, rigid_to_affine_init, stage1_rigid, stage2_affine, warm_start_cz_binary
+from autocoreg.initial_registration.surfaces import get_cz_surface_iter08, get_hcr_top_surface_iter07
 
 HERE = Path(__file__).resolve().parent
 FIG = HERE / "figures"

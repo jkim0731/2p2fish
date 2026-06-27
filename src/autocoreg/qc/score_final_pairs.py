@@ -1,10 +1,10 @@
 """Soma re-score every final matched pair (G2).
 
-The production final round is the Wang Stage-2 CSV, which carries only
+The production final round is the anchor-restricted Stage-2 CSV, which carries only
 ``sid,round,cz_id,hcr_id,is_gt`` — **no per-pair soma score**.  The QC app needs a
 per-pair confidence to surface the *least-confident* pairs first (highest soma
 distance).  This module recomputes, for every ``(cz_id, hcr_id)`` in a final matches
-CSV, the matcher's own soma-print score — reusing ``run_step3_v3.soma_score_radius``
+CSV, the matcher's own soma-print score — reusing the matcher's ``soma_score_radius``
 (same ``SOMA_M_CZ/M_HCR/N`` descriptor).
 
 **Frame = locked-prior (round-0), NOT TPS-warped.**  The matcher's own per-round score
@@ -33,16 +33,16 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from ..run_step2p5_refined import prepare_subject
-from ..run_step3_v3 import soma_score_radius, SOMA_M_CZ, SOMA_M_HCR, SOMA_N, R_CAND_UM
+from autocoreg.finetune_soma_print.pool_prep import prepare_subject
+from autocoreg.finetune_soma_print.matcher import soma_score_radius, SOMA_M_CZ, SOMA_M_HCR, SOMA_N, R_CAND_UM
 
 
 def _resolve_sz_pins(sid: str, sz_pins: dict | None) -> dict:
     if sz_pins is not None:
         return sz_pins
     # GT-free: image-based sz estimator (cached).
-    from ..benchmark_data_loader import load_subject
-    from ..sz_estimator import get_sz
+    from autocoreg.io.subjects import load_subject
+    from autocoreg.initial_registration.axial_scale import get_sz
     return {sid: float(get_sz(load_subject(sid))["sz_best"])}
 
 
