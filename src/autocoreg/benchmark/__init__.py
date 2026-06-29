@@ -11,13 +11,7 @@ Public API mirrors the GT-gated items from autocoreg.data:
     scoring_gt(inp)        — pose-independent GT {cz_id: hcr_id}
     strict_gfp_ids(sid)    — 07b GMM-intersection GFP+ (validation)
 """
-from ..data import (
-    BENCHMARK_SUBJECTS,
-    load_sz_pins,
-    scoring_gt,
-    strict_gfp_ids,
-    subject_inputs,
-)
+from autocoreg.io.inputs import BENCHMARK_SUBJECTS, load_sz_pins, scoring_gt, strict_gfp_ids, subject_inputs
 
 __all__ = [
     "BENCHMARK_SUBJECTS",

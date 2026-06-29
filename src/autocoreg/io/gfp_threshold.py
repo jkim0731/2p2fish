@@ -29,13 +29,8 @@ import numpy as np
 import pandas as pd
 from sklearn.mixture import GaussianMixture
 
-from . import config as _config
-from .benchmark_data_loader import (
-    DATA_DIR,
-    BENCHMARK_SUBJECTS,
-    _aggregate_spots_from_hcr,
-    load_subject,
-)
+from autocoreg import config as _config
+from autocoreg.io.subjects import DATA_DIR, BENCHMARK_SUBJECTS, _aggregate_spots_from_hcr, load_subject
 
 # Output paths routed through config so they land in a writable location.
 # These are optional outputs (the JSON result and PNG figures); they are NOT

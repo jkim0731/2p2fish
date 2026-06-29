@@ -40,33 +40,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .benchmark_analysis import (
-    estimate_pia_surface_image_ceiling,
-    estimate_pia_surface_quantile_ceiling,
-    list_hcr_channels,
-    load_hcr_combined,
-    load_hcr_volume,
-)
-from .benchmark_data_loader import hcr_px_to_um, load_subject
-from .iter07_compute import (
-    col_detect_transition,
-    eval_polysurf,
-    fit_polysurf,
-    sampling_grid,
-    EPS,
-    HUBER_K,
-    PATCH_W,
-    POLY_DEGREE,
-    SMOOTH_Z_UM,
-    SUSTAIN_Z_UM,
-    TRANS_FRAC,
-    THR_FLOOR,
-    detect_transitions as detect_top_transitions,
-    get_n22,
-)
+from autocoreg.io.hcr_image import estimate_pia_surface_image_ceiling, estimate_pia_surface_quantile_ceiling, list_hcr_channels, load_hcr_combined, load_hcr_volume
+from autocoreg.io.subjects import hcr_px_to_um, load_subject
+from autocoreg.initial_registration.surface_detect import col_detect_transition, eval_polysurf, fit_polysurf, sampling_grid, EPS, HUBER_K, PATCH_W, POLY_DEGREE, SMOOTH_Z_UM, SUSTAIN_Z_UM, TRANS_FRAC, THR_FLOOR, detect_transitions as detect_top_transitions, get_n22
 
-OUT_FIG = Path("/tmp")
-OUT_DATA = Path("/tmp")
+OUT_FIG = Path("/scratch/autocoreg_outputs/dev")
+OUT_DATA = Path("/scratch/autocoreg_outputs/dev")
 
 HCR = ["755252", "767018", "767022", "782149", "788406", "790322"]
 MAD_GATE_K = 3.0  # per-column outlier gate for bottom-z before poly fit

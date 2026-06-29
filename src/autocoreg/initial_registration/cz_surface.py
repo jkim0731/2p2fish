@@ -46,22 +46,12 @@ import numpy as np
 import pandas as pd
 import tifffile
 
-from .benchmark_analysis import analyze_subject, estimate_pia_surface
-from .benchmark_data_loader import cz_px_to_um, load_subject
-from .iter07_compute import (
-    col_detect_transition,
-    eval_polysurf,
-    fit_polysurf,
-    sampling_grid,
-    HUBER_K,
-    PATCH_W,
-    POLY_DEGREE,
-    SMOOTH_Z_UM,
-    SUSTAIN_Z_UM,
-)
+from autocoreg.io.hcr_image import analyze_subject, estimate_pia_surface
+from autocoreg.io.subjects import cz_px_to_um, load_subject
+from autocoreg.initial_registration.surface_detect import col_detect_transition, eval_polysurf, fit_polysurf, sampling_grid, HUBER_K, PATCH_W, POLY_DEGREE, SMOOTH_Z_UM, SUSTAIN_Z_UM
 
-OUT_FIG = Path("/tmp")
-OUT_DATA = Path("/tmp")
+OUT_FIG = Path("/scratch/autocoreg_outputs/dev")
+OUT_DATA = Path("/scratch/autocoreg_outputs/dev")
 
 SUBJECTS = ["755252", "767018", "767022", "782149", "788406", "790322"]
 

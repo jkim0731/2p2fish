@@ -23,10 +23,10 @@ from __future__ import annotations
 
 import numpy as np
 
-from .benchmark_analysis import load_hcr_volume
-from .cz_volume import load_cz_volume
-from .locked_prior_warm import apply_to_cz_um, compute_locked_prior_warm_start
-from .sz_estimator import get_sz
+from autocoreg.io.hcr_image import load_hcr_volume
+from autocoreg.io.cz_volume import load_cz_volume
+from autocoreg.initial_registration.locked_prior import apply_to_cz_um, compute_locked_prior_warm_start
+from autocoreg.initial_registration.axial_scale import get_sz
 
 # Level-2 is the centroid / seg-zarr frame.  Voxel sizes at level-2 are
 # s.hcr_xy_um and s.hcr_z_um (stored directly on SubjectData — no rescaling

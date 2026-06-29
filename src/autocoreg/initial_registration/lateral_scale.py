@@ -107,22 +107,10 @@ import tifffile
 import zarr
 from skimage.measure import regionprops
 
-from . import config as _config
-from .benchmark_analysis import (
-    analyze_subject,
-    depth_from_surface,
-    fit_anisotropic_similarity,
-)
-from .benchmark_data_loader import (
-    DATA_DIR,
-    HCR_SEG_XY_DOWNSAMPLE,
-    SubjectData,
-    cz_px_to_um,
-    hcr_px_to_um,
-    landmark_pairs_um,
-    load_subject,
-)
-from .r1_revised import coarse_align_revised
+from autocoreg import config as _config
+from autocoreg.io.hcr_image import analyze_subject, depth_from_surface, fit_anisotropic_similarity
+from autocoreg.io.subjects import DATA_DIR, HCR_SEG_XY_DOWNSAMPLE, SubjectData, cz_px_to_um, hcr_px_to_um, landmark_pairs_um, load_subject
+from autocoreg.initial_registration.coarse_align import coarse_align_revised
 
 SPOT_SUBJECTS = frozenset({"788406", "790322", "767018", "782149"})
 INTENSITY_SUBJECTS = frozenset({"755252", "767022"})
@@ -673,7 +661,7 @@ def estimate_sxy_roi_area(
     strict_cutoff = None
     n_components = None
     if strict_hcr_ids is None:
-        from . import gfp_intersection_threshold as _gfp
+        from autocoreg.io import gfp_threshold as _gfp
         gi = _gfp.analyze_subject(sid)
         strict_cutoff = float(gi.cutoff_linear)
         n_components = int(gi.n_components)
@@ -815,7 +803,7 @@ def estimate_sxy_roi_area_slab(
     strict_cutoff = None
     n_components = None
     if strict_hcr_ids is None:
-        from . import gfp_intersection_threshold as _gfp
+        from autocoreg.io import gfp_threshold as _gfp
         gi = _gfp.analyze_subject(sid)
         strict_cutoff = float(gi.cutoff_linear)
         n_components = int(gi.n_components)
@@ -844,8 +832,8 @@ def estimate_sxy_roi_area_slab(
     # cached surface registration (called BEFORE compute_surface_registration
     # writes the new cache), so it uses the warm-start bbox.
     try:
-        from .run_step2p5_refined import prepare_subject
-        from .data import load_sz_pins
+        from autocoreg.finetune_soma_print.pool_prep import prepare_subject
+        from autocoreg.io.inputs import load_sz_pins
         _sz_pins = load_sz_pins()
         _subj = prepare_subject(sid, sz_pins=_sz_pins)
         _spatial_pool = set(int(h) for h in _subj["hcr_pool_ids"]) & pool
@@ -999,7 +987,7 @@ def estimate_sxy_min_rule(sid: str, strict_hcr_ids=None) -> dict:
     # n_strict values (e.g. 790322 9675 vs loader ~13k).  Do NOT substitute
     # s.hcr_gfp_df here — that gives a different cell set and a different sxy.
     if strict_hcr_ids is None:
-        from . import gfp_intersection_threshold as _gfp
+        from autocoreg.io import gfp_threshold as _gfp
         gi = _gfp.analyze_subject(sid)
         strict_df = _gfp.strict_gfp_df(sid, float(gi.cutoff_linear))
         strict_hcr_ids = set(int(x) for x in strict_df["hcr_id"].values)

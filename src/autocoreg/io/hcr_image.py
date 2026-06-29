@@ -20,12 +20,7 @@ import numpy as np
 import pandas as pd
 from scipy.spatial import cKDTree
 
-from .benchmark_data_loader import (
-    SubjectData,
-    cz_px_to_um,
-    hcr_px_to_um,
-    landmark_pairs_um,
-)
+from autocoreg.io.subjects import SubjectData, cz_px_to_um, hcr_px_to_um, landmark_pairs_um
 
 
 # ===========================================================
@@ -1459,11 +1454,7 @@ def analyze_subject(
     hcr_top_surface_iter07 = None
     hcr_bottom_surface_iter08 = None
     try:
-        from .surfaces_iter08 import (
-            get_cz_surface_iter08,
-            get_hcr_top_surface_iter07,
-            get_hcr_bottom_surface_iter08,
-        )
+        from autocoreg.initial_registration.surfaces import get_cz_surface_iter08, get_hcr_top_surface_iter07, get_hcr_bottom_surface_iter08
         cz_surface_iter08 = get_cz_surface_iter08(s)
         hcr_top_surface_iter07 = get_hcr_top_surface_iter07(
             s, level=hcr_level_for_surface)

@@ -32,16 +32,16 @@ import numpy as np
 import pandas as pd
 from scipy.spatial import cKDTree
 
-from .data import BENCHMARK_SUBJECTS, load_sz_pins, subject_inputs
-from .run_step1_oracle import metrics_from_D
-from .run_step2_locked import _score_soma_per_gt
-from .soma_print import cell_vectors
-from .surfaces_iter08 import get_hcr_top_surface_iter07
+from autocoreg.io.inputs import BENCHMARK_SUBJECTS, load_sz_pins, subject_inputs
+from autocoreg.archive.oracle_benchmark import metrics_from_D
+from autocoreg.archive.locked_benchmark import _score_soma_per_gt
+from autocoreg.finetune_soma_print.descriptor import cell_vectors
+from autocoreg.initial_registration.surfaces import get_hcr_top_surface_iter07
 
-MATCH_DIR = Path("/tmp/autocoreg_outputs/step2p5_matches")
+MATCH_DIR = Path("/scratch/autocoreg_outputs/step2p5_matches")
 MATCH_DIR.mkdir(parents=True, exist_ok=True)
 
-OUT_DIR = Path("/tmp/autocoreg_outputs")
+OUT_DIR = Path("/scratch/autocoreg_outputs")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Same soma config family as Step 2 winning region

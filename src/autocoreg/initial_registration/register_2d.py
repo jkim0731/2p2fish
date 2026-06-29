@@ -48,17 +48,14 @@ try:
 except ImportError:
     sitk = types.SimpleNamespace()
 
-from .benchmark_analysis import load_hcr_volume
-from .benchmark_data_loader import load_subject
-from .roi_area_sxy import estimate_sxy_roi_area
-from .surfaces_iter08 import (
-    get_cz_surface_iter08,
-    get_hcr_top_surface_iter07,
-)
-from .compute_projections import top_slab_projection
+from autocoreg.io.hcr_image import load_hcr_volume
+from autocoreg.io.subjects import load_subject
+from autocoreg.initial_registration.lateral_scale import estimate_sxy_roi_area
+from autocoreg.initial_registration.surfaces import get_cz_surface_iter08, get_hcr_top_surface_iter07
+from autocoreg.initial_registration.projections import top_slab_projection
 
 HERE = Path(__file__).resolve().parent
-FIG = Path("/tmp")  # figures go to /tmp in package context (was HERE/figures)
+FIG = Path("/scratch/autocoreg_outputs/dev")  # figures go to /scratch in package context (was HERE/figures)
 SUBJECTS = ["788406", "790322", "767018", "782149", "755252", "767022"]
 HCR_LEVEL = 4
 
@@ -472,8 +469,8 @@ def get_sxy_with_fallback(sid: str, s) -> tuple[float, str]:
     try:
         return float(estimate_sxy_roi_area(sid)["sxy_median"]), "bbox"
     except Exception:
-        from .benchmark_analysis import fit_anisotropic_similarity
-        from .benchmark_data_loader import landmark_pairs_um
+        from autocoreg.io.hcr_image import fit_anisotropic_similarity
+        from autocoreg.io.subjects import landmark_pairs_um
         cz_um, hcr_um = landmark_pairs_um(s, active_only=True)
         fit = fit_anisotropic_similarity(cz_um, hcr_um)
         return float(np.sqrt(fit.scales[0] * fit.scales[1])), "landmark_gt_fallback"

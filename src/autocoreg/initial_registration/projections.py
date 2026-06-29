@@ -19,18 +19,12 @@ from pathlib import Path
 import numpy as np
 import tifffile
 
-from .benchmark_analysis import (
-    list_hcr_channels,
-    load_hcr_volume,
-)
-from .benchmark_data_loader import load_subject
-from .surfaces_iter08 import (
-    get_cz_surface_iter08,
-    get_hcr_top_surface_iter07,
-)
+from autocoreg.io.hcr_image import list_hcr_channels, load_hcr_volume
+from autocoreg.io.subjects import load_subject
+from autocoreg.initial_registration.surfaces import get_cz_surface_iter08, get_hcr_top_surface_iter07
 
 HERE = Path(__file__).resolve().parent
-FIG = Path("/tmp")  # figures go to /tmp in package context (was HERE/figures)
+FIG = Path("/scratch/autocoreg_outputs/dev")  # figures go to /scratch in package context (was HERE/figures)
 
 SUBJECTS = ["788406", "790322"]
 HCR_LEVEL = 4  # ~4 µm XY / 4 µm Z — plenty for top-surface vessels

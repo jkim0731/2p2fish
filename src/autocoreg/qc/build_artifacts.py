@@ -32,9 +32,9 @@ import tifffile
 from scipy.interpolate import Rbf
 from scipy.ndimage import map_coordinates
 
-from .. import config as _config
-from ..cz_volume import load_cz_volume
-from ..data import load_sz_pins, subject_inputs
+from autocoreg import config as _config
+from autocoreg.io.cz_volume import load_cz_volume
+from autocoreg.io.inputs import load_sz_pins, subject_inputs
 
 # Default output voxel size (µm) for the warped CZ image + CZ/HCR seg overlays.
 # 2.0 µm gives crisp ROI boundaries + CZ image (4.0 was blocky); env-overridable.
@@ -71,16 +71,17 @@ def _warp_zslice_chunk(k_range):
 
 
 def final_round_csv(sid_out_dir) -> Path:
-    """Final-round matcher CSV in a ``run_step3_v3`` ``<out_dir>/<sid>/`` dir:
-    last ``matches_wang_round*.csv`` (Stage-2) if present, else last
-    ``matches_round*.csv`` (Stage-1)."""
+    """Final-round matcher CSV in a matcher ``<out_dir>/<sid>/`` dir: last
+    ``matches_anchor_restricted_round*.csv`` (Stage-2) if present, else last
+    ``matches_round*.csv`` (Stage-1).  ``matches_wang_round*`` accepted as legacy."""
+    import re
     d = Path(sid_out_dir)
-    wang = sorted(d.glob("matches_wang_round*.csv"),
-                  key=lambda p: int(p.stem.replace("matches_wang_round", "")))
-    if wang:
-        return wang[-1]
+    for pat in ("matches_anchor_restricted_round*.csv", "matches_wang_round*.csv"):
+        cands = sorted(d.glob(pat), key=lambda p: int(re.findall(r"\d+", p.stem)[-1]))
+        if cands:
+            return cands[-1]
     rounds = sorted(d.glob("matches_round*.csv"),
-                    key=lambda p: int(p.stem.replace("matches_round", "")))
+                    key=lambda p: int(re.findall(r"\d+", p.stem)[-1]))
     if not rounds:
         raise FileNotFoundError(f"No matches CSVs under {d}")
     return rounds[-1]

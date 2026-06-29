@@ -19,9 +19,9 @@ from pathlib import Path
 
 from PyQt5 import QtWidgets
 
-from .. import config as _config
+from autocoreg import config as _config
 
-DEFAULT_VARIANT = "step3_v3_anchor_vote_wang_end"
+DEFAULT_VARIANT = "anchor_vote_anchor_restricted"
 
 
 def discover_labeled_subjects() -> list[tuple[str, Path]]:
@@ -40,7 +40,7 @@ def discover_labeled_subjects() -> list[tuple[str, Path]]:
 def find_matches_csv(sid: str, variant: str) -> Path | None:
     """Latest final-round matcher CSV for (sid, variant) under QC_MATCHES_DIR."""
     d = _config.QC_MATCHES_DIR / variant / sid
-    for pat in ("matches_wang_round*.csv", "matches_round*.csv"):
+    for pat in ("matches_anchor_restricted_round[0-9]*.csv", "matches_wang_round[0-9]*.csv", "matches_round[0-9]*.csv"):
         cands = sorted(d.glob(pat),
                        key=lambda p: int(re.findall(r"\d+", p.stem)[-1] or 0))
         if cands:

@@ -45,8 +45,8 @@ Keys:
   Esc        reset the pending selection (add-match mode)
 
 Usage:
-  autocoreg run <sid> --qc [--qc-variant local_flow_wang_end]
-  python -c "from autocoreg.qc.app import main; main(['--sid','790322','--variant','local_flow_wang_end'])"
+  autocoreg run <sid> --qc [--qc-variant anchor_vote_anchor_restricted]
+  python -c "from autocoreg.qc.app import main; main(['--sid','790322','--variant','anchor_vote_anchor_restricted'])"
 """
 from __future__ import annotations
 
@@ -64,10 +64,10 @@ import tifffile
 from PyQt5 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
-from .. import config as _config
-from ..benchmark_data_loader import load_subject
-from ..centroid_helpers import centroids_um
-from ..benchmark_analysis import hcr_level_resolution
+from autocoreg import config as _config
+from autocoreg.io.subjects import load_subject
+from autocoreg.io.centroids import centroids_um
+from autocoreg.io.hcr_image import hcr_level_resolution
 
 # Artifact inputs + label outputs are resolved from config (env-overridable).
 OUT_ROOT = _config.QC_ARTIFACT_DIR
@@ -118,9 +118,9 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--sid", required=True)
     # Free-text (not choices): must accept the production variant
-    # step3_v3_anchor_vote_wang_end as well as the legacy session variants.
-    p.add_argument("--variant", default="step3_v3_anchor_vote_wang_end",
-                   help="Matcher/QC variant dir name (e.g. step3_v3_anchor_vote_wang_end).")
+    # anchor_vote_anchor_restricted as well as the legacy session variants.
+    p.add_argument("--variant", default="anchor_vote_anchor_restricted",
+                   help="Matcher/QC variant dir name (e.g. anchor_vote_anchor_restricted).")
     p.add_argument("--final-pairs", dest="final_pairs", default=None,
                    help="Path to final_pairs.csv (cz_id,hcr_id,soma_score). If omitted, "
                         "the app looks in the artifact dir and computes+caches it if absent.")
@@ -150,18 +150,18 @@ def parse_args(argv=None):
 def find_final_round_csv(sid: str, variant: str) -> Path:
     """Locate the final-round matcher CSV for (sid, variant).
 
-    Looks under ``MFISH_QC_MATCHES_DIR/step3_v2_path_a_<variant>/<sid>/`` and
-    returns the last ``matches_wang_round*.csv`` if any, else the last
-    ``matches_round*.csv``.  (Vendored from the session-15 qc_pair_app so the
-    repo has no flat-module dependency.)
+    Looks under ``MFISH_QC_MATCHES_DIR/<variant>/<sid>/`` and returns the last
+    ``matches_anchor_restricted_round*.csv`` if any, else the last
+    ``matches_round*.csv``.  ``matches_wang_round*`` accepted as legacy.
     """
-    d = _config.QC_MATCHES_DIR / f"step3_v2_path_a_{variant}" / sid
-    wang_rounds = sorted(d.glob("matches_wang_round*.csv"),
-                         key=lambda p: int(p.stem.replace("matches_wang_round", "")))
-    if wang_rounds:
-        return wang_rounds[-1]
+    import re
+    d = _config.QC_MATCHES_DIR / variant / sid
+    for pat in ("matches_anchor_restricted_round*.csv", "matches_wang_round*.csv"):
+        cands = sorted(d.glob(pat), key=lambda p: int(re.findall(r"\d+", p.stem)[-1]))
+        if cands:
+            return cands[-1]
     rounds = sorted(d.glob("matches_round*.csv"),
-                    key=lambda p: int(p.stem.replace("matches_round", "")))
+                    key=lambda p: int(re.findall(r"\d+", p.stem)[-1]))
     if not rounds:
         raise FileNotFoundError(f"No matches CSVs under {d}")
     return rounds[-1]
@@ -356,7 +356,7 @@ class QCApp(QtWidgets.QMainWindow):
         ))
         # Snapshot the matcher's original mapping so add-match overrides can be undone.
         self._auto_cz_to_hcr = dict(self.cz_to_hcr)
-        # Per-pair soma-print score (G2): the production Wang final CSV has no
+        # Per-pair soma-print score (G2): the production anchor-restricted final CSV has no
         # soma_score column, so load/compute final_pairs.csv (cz_id,hcr_id,soma_score)
         # — soma is a DISTANCE, lower = better match.  cz_to_soma drives the queue sort.
         self.cz_to_soma = self._load_soma_scores(qc_dir, matches_csv)

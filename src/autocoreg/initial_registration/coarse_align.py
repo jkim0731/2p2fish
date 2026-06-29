@@ -38,7 +38,7 @@ from pathlib import Path
 import numpy as np
 from scipy.ndimage import gaussian_filter
 
-from .benchmark_analysis import depth_from_surface
+from autocoreg.io.hcr_image import depth_from_surface
 
 
 PRIOR_ROTATION_DEG_Z = 180.0

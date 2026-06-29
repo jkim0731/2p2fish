@@ -1,23 +1,35 @@
-"""mfish-autocoreg: automated coregistration pipeline for mFISH / Ca-imaging data.
+"""mfish-autocoreg: automated coregistration of mFISH (HCR) and Ca-imaging (CZ).
 
-Core pipeline (GT-free):
-    surfaces_iter08     — CZ + HCR surface fitting (iter07/08)
-    surface_registration_v2 — MIP-based surface registration (affine/PWR)
-    roi_area_sxy        — sxy estimation from ROI cross-sections
-    sz_estimator        — sz estimation from FFT-NCC slab sweep
-    locked_prior_warm   — locked-prior warm-start pose
-    overlap_crop        — overlap bounding box
+Two-stage, GT-free protocol:
 
-Matching:
-    data                — SubjectInputs bundle (GT-optional)
-    soma_print, shape_context, local_ncc, loo_image_ncc
-    run_step1_oracle, run_step2_locked, run_step2p5_refined,
-    run_step3_iterative, run_step3_v3
+initial_registration/    — rough/warm registration (CZ → HCR µm)
+    surfaces             — CZ + HCR surface fitting
+    lateral_scale        — sxy from ROI cross-sections
+    surface_registration — MIP-based surface registration (affine/PWR)
+    axial_scale          — sz from FFT-NCC slab sweep
+    locked_prior         — locked-prior warm-start pose
+    overlap_crop         — overlap bounding box
+    coarse_align         — scale-free coarse affine
+    surface_detect, cz_surface, hcr_bottom_surface, binarize,
+    projections, register_2d, register_nonrigid  — surface/registration helpers
 
-QC (requires [qc] extras):
-    qc.app              — PyQt5 viewer
+finetune_soma_print/     — 3-D soma-print cell-cell fine matching
+    descriptor           — m-NN soma-print descriptor
+    pool_prep            — candidate-pool construction (locked-prior frame)
+    tps                  — thin-plate-spline warp + neighbour scoring / anchor-vote
+    scoring              — vectorised soma-print scoring
+    matcher              — production matcher (gate: anchor_vote + Stage-2 anchor_restricted)
+    local_ncc, loo_image_ncc  — image-NCC gate helpers
 
-Validation only (benchmark/):
-    benchmark.scoring_gt, benchmark.BENCHMARK_SUBJECTS, etc.
+io/                      — shared data loading
+    subjects, inputs, centroids, hcr_image, cz_volume, gfp_threshold
+
+qc/                      — PyQt5 QC viewer + artifacts (requires [qc] extras)
+
+archive/                 — superseded protocols kept for comparison
+    shape_context, oracle_benchmark, locked_benchmark,
+    refined_benchmark, iterative_matcher
+
+benchmark/               — GT-based validation API (validation data only)
 """
 __version__ = "0.1.0"
