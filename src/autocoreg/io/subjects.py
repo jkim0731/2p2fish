@@ -18,11 +18,14 @@ import glob
 import json
 import os
 import pickle
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import tifffile
+from scipy import ndimage as ndi
 
 
 # Default minimum spots per cell to define a GFP+ HCR cell. Used only when
@@ -117,12 +120,83 @@ class SubjectData:
 # -----------------------------------------------------------
 # path resolution
 # -----------------------------------------------------------
+def _find_czstack_seg_dir(subject_id: str) -> Path | None:
+    matches = sorted(DATA_DIR.glob(f"multiplane-ophys_{subject_id}_*cortical-zstack-segmentation*"))
+    return matches[-1] if matches else None
+
+
+def _synthesize_coreg_dir(subject_id: str) -> Path | None:
+    """Build a coreg dir from the attached cortical-zstack REGISTRATION + SEGMENTATION assets
+    when no manual ``*ctl-czstack-hcr-coreg_*`` dir is present (the automated / pipeline-monitor
+    path). Mirrors ``code/manual workflow/step_1_process_files.ipynb`` — minus the manual GT:
+
+      * CZ z-stack       -> symlink the registration's ``*_2xREG.tif`` as ``{name}_zstack.tif``
+        (tifffile reads the same (Z,Y,X) array; step_1's dim-swap is only for FIJI display);
+      * seg-mask-outline -> the segmentation binary ``(masks>0)`` as ``{name}_seg-mask-outline.tif``
+        (``load_cz_binary_volume`` fill-holes → identical solid cell bodies, so the erode-edge
+        outline is unnecessary);
+      * czstack centroids -> ``center_of_mass`` of the segmentation, as
+        ``{name}_czstack_cell_centroids.csv`` (exactly step_1's computation).
+
+    No ``coreg_table`` / qced landmarks are written (the matcher is GT-free; those degrade to
+    empty downstream — they are validation-only). Returns the synthesized dir, or None if the
+    registration/segmentation assets are missing.
+    """
+    reg_dir = _find_czstack_reg_dir(subject_id)
+    seg_dir = _find_czstack_seg_dir(subject_id)
+    if reg_dir is None or seg_dir is None:
+        return None
+    reg_tifs = (sorted(reg_dir.rglob("*_2xREG.tif"))
+                or sorted(reg_dir.rglob("cortical_zstack_*.tif")))
+    seg_tifs = sorted(seg_dir.rglob("segmentation_masks.tif"))
+    if not reg_tifs or not seg_tifs:
+        return None
+    reg_tif, seg_tif = reg_tifs[0], seg_tifs[0]
+    name = "_".join(reg_dir.name.split("_")[1:3])              # {sid}_{session-date}
+    out = Path(os.environ.get("MFISH_COREG_DIR",
+                              str(_config.CACHE_DIR / "synthesized_coreg"))) / f"{name}_ctl-czstack-hcr-coreg_auto"
+    out.mkdir(parents=True, exist_ok=True)
+
+    zstack = out / f"{name}_zstack.tif"
+    if not zstack.exists():
+        try:
+            zstack.symlink_to(reg_tif)
+        except OSError:
+            shutil.copy(reg_tif, zstack)
+
+    masks = None
+    outline = out / f"{name}_seg-mask-outline.tif"
+    if not outline.exists():
+        masks = tifffile.imread(str(seg_tif))
+        tifffile.imwrite(str(outline), (masks > 0).astype(np.uint8))
+
+    cents = out / f"{name}_czstack_cell_centroids.csv"
+    if not cents.exists():
+        if masks is None:
+            masks = tifffile.imread(str(seg_tif))
+        ids = np.unique(masks); ids = ids[ids != 0]
+        com = np.asarray(ndi.center_of_mass(np.ones_like(masks), labels=masks, index=ids))
+        pd.DataFrame({"czstack_cell_id": ids.astype(int),
+                      "czstack_z": com[:, 0], "czstack_y": com[:, 1], "czstack_x": com[:, 2]}
+                     ).to_csv(cents, index=False)
+    return out
+
+
 def _find_coreg_dir(subject_id: str) -> Path:
+    """Manual ``*ctl-czstack-hcr-coreg_*`` dir if attached; else SYNTHESIZE one from the
+    attached cortical-zstack registration + segmentation (automated / pipeline-monitor path)."""
     matches = sorted(DATA_DIR.glob(f"{subject_id}*ctl-czstack-hcr-coreg_*"))
-    if not matches:
-        raise FileNotFoundError(f"No coreg dir for {subject_id}")
-    # Use the most recent one
-    return matches[-1]
+    if matches:
+        return matches[-1]                                     # most recent manual coreg dir
+    synth = _synthesize_coreg_dir(subject_id)
+    if synth is not None:
+        print(f"[load_subject] no manual coreg dir for {subject_id}; synthesized one from the "
+              f"cortical-zstack registration + segmentation -> {synth}", flush=True)
+        return synth
+    raise FileNotFoundError(
+        f"No coreg dir for {subject_id}, and could not synthesize one — attach the "
+        f"multiplane-ophys_{subject_id}_*cortical-zstack-registration_* + "
+        f"*cortical-zstack-segmentation_* assets.")
 
 
 def _find_hcr_dir(subject_id: str) -> Path:
