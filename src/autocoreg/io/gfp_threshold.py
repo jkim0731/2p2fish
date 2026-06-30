@@ -43,6 +43,46 @@ SPOT_SUBJECTS = {"788406", "790322", "767018", "782149"}
 INTENSITY_SUBJECTS = {"755252", "767022"}
 
 
+def detect_gfp_class(sid: str) -> str:
+    """Return the GFP-feature class for a subject: ``'spot'`` or ``'intensity'``.
+
+    The six benchmark subjects keep their hardcoded class (behaviour unchanged).
+    Any other subject (new / pipeline-monitor data) is classified from the
+    attached HCR data so the automated path needs no per-subject list edit:
+
+      * ``'spot'`` if a ``*spot_488_counts.csv`` is present in the coreg dir, or
+        the HCR processed asset carries 488 spot detection
+        (``image_spot_detection/channel_488_spots/spots.csv``);
+      * else ``'intensity'`` if a ``cell_data_mean_{sid}_R1.csv`` is present;
+      * else ``'spot'`` (the modern-HCR default — every recent HCR run produces
+        488 spot detection; if no feature is actually loadable, the downstream
+        ``analyze_subject`` / ``strict_gfp_df`` raise a clear error).
+
+    Detection uses cheap path-existence checks only (no large CSV reads).
+    """
+    if sid in SPOT_SUBJECTS:
+        return "spot"
+    if sid in INTENSITY_SUBJECTS:
+        return "intensity"
+    hcr_dir = None
+    try:
+        s = load_subject(sid)
+        if list(Path(s.coreg_dir).glob("*spot_488_counts.csv")):
+            return "spot"
+        hcr_dir = Path(s.hcr_dir)
+    except Exception:
+        hcr_dir = None
+    if hcr_dir is not None and (
+        hcr_dir / "image_spot_detection" / "channel_488_spots" / "spots.csv"
+    ).exists():
+        return "spot"
+    for cand in (Path(DATA_DIR) / f"cell_data_mean_{sid}_R1.csv",
+                 Path(_config.DATA_LEVEL) / f"cell_data_mean_{sid}_R1.csv"):
+        if cand.exists():
+            return "intensity"
+    return "spot"
+
+
 @dataclass
 class GmmIntersection:
     subject: str
@@ -346,7 +386,8 @@ def analyze_subject(sid: str) -> GmmIntersection:
     v22_df = s.hcr_gfp_df
     n_v22 = int(len(v22_df))
 
-    if sid in SPOT_SUBJECTS:
+    gfp_class = detect_gfp_class(sid)
+    if gfp_class == "spot":
         df_feat = _load_spot_feature(sid)
         feat_values = df_feat["density"].values.astype(float)
         log_x = np.log(feat_values[feat_values > 0])
@@ -359,7 +400,7 @@ def analyze_subject(sid: str) -> GmmIntersection:
             v22_cut = float("nan")
         feature_name = "density"
         log_base = "ln"
-    elif sid in INTENSITY_SUBJECTS:
+    elif gfp_class == "intensity":
         df_feat = _load_intensity_feature(sid)
         feat_values = df_feat["mean_minus_bg"].values.astype(float)
         log_x = np.log10(feat_values[feat_values > 0])
@@ -375,7 +416,7 @@ def analyze_subject(sid: str) -> GmmIntersection:
         feature_name = "mean_minus_bg"
         log_base = "log10"
     else:
-        raise ValueError(f"unknown subject class for {sid}")
+        raise ValueError(f"unknown subject class for {sid}")  # detect_gfp_class never returns this
 
     # Apply strict cutoff and compute coverage
     mask = df_feat[feature_name].values.astype(float) >= cutoff
@@ -458,13 +499,14 @@ def strict_gfp_df(sid: str, cutoff_linear: float) -> pd.DataFrame:
     Columns: ``hcr_id`` plus the feature column (``density`` or
     ``mean_minus_bg``).  Matches the original ``07b`` public API.
     """
-    if sid in SPOT_SUBJECTS:
+    gfp_class = detect_gfp_class(sid)
+    if gfp_class == "spot":
         df_feat = _load_spot_feature(sid)
         return df_feat[df_feat["density"].values.astype(float) >= cutoff_linear].reset_index(drop=True)
-    if sid in INTENSITY_SUBJECTS:
+    if gfp_class == "intensity":
         df_feat = _load_intensity_feature(sid)
         return df_feat[df_feat["mean_minus_bg"].values.astype(float) >= cutoff_linear].reset_index(drop=True)
-    raise ValueError(f"unknown subject class for {sid}")
+    raise ValueError(f"unknown subject class for {sid}")  # detect_gfp_class never returns this
 
 
 def main():

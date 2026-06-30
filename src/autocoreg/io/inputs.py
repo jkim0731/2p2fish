@@ -38,8 +38,25 @@ def _load_gmm_threshold(sid: str) -> dict:
 
 
 def strict_gfp_ids(sid: str) -> tuple[set[int], dict]:
-    """Strict-GFP+ HCR ids using the cached 07b GMM-intersection cutoff."""
-    rec = _load_gmm_threshold(sid)
+    """Strict-GFP+ HCR ids using the 07b GMM-intersection cutoff.
+
+    Benchmark subjects use the cached threshold JSON.  Any subject not in the
+    cache (new / pipeline-monitor data, or a missing JSON) gets the cutoff
+    computed live via ``gfp_threshold.analyze_subject`` — the same seeded GMM —
+    so the automated path needs no pre-cached threshold.
+    """
+    try:
+        rec = _load_gmm_threshold(sid)
+    except (FileNotFoundError, StopIteration, json.JSONDecodeError):
+        from autocoreg.io import gfp_threshold as _gfp
+        gi = _gfp.analyze_subject(sid)
+        rec = {
+            "cutoff_linear": float(gi.cutoff_linear),
+            "feature_name": gi.feature_name,
+            "coreg_total": int(gi.coreg_total),
+            "coreg_kept_strict": int(gi.coreg_kept_strict),
+            "coreg_coverage_strict": float(gi.coreg_coverage_strict),
+        }
     cutoff = float(rec["cutoff_linear"])
     feature = rec["feature_name"]
     s = load_subject(sid)

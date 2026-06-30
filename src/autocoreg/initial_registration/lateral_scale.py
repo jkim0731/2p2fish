@@ -115,6 +115,22 @@ from autocoreg.initial_registration.coarse_align import coarse_align_revised
 SPOT_SUBJECTS = frozenset({"788406", "790322", "767018", "782149"})
 INTENSITY_SUBJECTS = frozenset({"755252", "767022"})
 
+
+def _gt_aniso_fit(s: SubjectData):
+    """Anisotropic-similarity fit to the QCed GT landmarks, or ``None`` when GT
+    is unavailable.
+
+    Benchmark subjects ship manually-QCed landmarks; new / pipeline-monitor
+    subjects have none (``landmark_pairs_um`` returns empty), so the fit cannot
+    be computed.  Callers treat ``None`` as "GT unavailable" and report ``NaN``
+    for the diagnostic ``*_gt`` / ``err_pct`` fields — these never feed the pose,
+    so they are pure validation read-outs.
+    """
+    try:
+        return fit_anisotropic_similarity(*landmark_pairs_um(s, active_only=True))
+    except (ValueError, IndexError):
+        return None
+
 TIGHT_BBOX_CACHE = _config.HCR_TIGHT_BBOX_CACHE_DIR
 TIGHT_BBOX_CACHE.mkdir(parents=True, exist_ok=True)
 TIGHT_BBOX_VERSION = "v1"
@@ -646,8 +662,9 @@ def estimate_sxy_roi_area(
     """
     if area_mode not in ("bbox", "max_xsection"):
         raise ValueError(f"area_mode must be 'bbox' or 'max_xsection', got {area_mode!r}")
-    if sid not in (SPOT_SUBJECTS | INTENSITY_SUBJECTS):
-        raise ValueError(f"{sid}: unknown subject")
+    # No hardcoded subject-set gate: the GFP class (spot/intensity) is detected
+    # from the attached data downstream (gfp_threshold.detect_gfp_class), so new
+    # subjects are supported.  Missing feature data raises a clear error there.
     # 755252 / 767022 (INTENSITY_SUBJECTS) lack metrics.pickle but DO have
     # segmentation_mask.zarr + cell_centroids.npy, so _load_hcr_metrics
     # reconstructs the per-cell index — they are supported here.
@@ -696,8 +713,8 @@ def estimate_sxy_roi_area(
     sxy_med = float(np.sqrt(med_hcr / med_cz))
     sxy_mean = float(np.sqrt(mean_hcr / mean_cz))
 
-    fit = fit_anisotropic_similarity(*landmark_pairs_um(s, active_only=True))
-    sxy_gt = float(np.sqrt(fit.scales[0] * fit.scales[1]))
+    _gt = _gt_aniso_fit(s)
+    sxy_gt = float(np.sqrt(_gt.scales[0] * _gt.scales[1])) if _gt is not None else float("nan")
 
     return {
         "sid": sid,
@@ -793,8 +810,9 @@ def estimate_sxy_roi_area_slab(
         If fewer than 5 HCR or CZ cells survive the slab filter (the
         median would be unreliable).
     """
-    if sid not in (SPOT_SUBJECTS | INTENSITY_SUBJECTS):
-        raise ValueError(f"{sid}: unknown subject")
+    # No hardcoded subject-set gate: the GFP class (spot/intensity) is detected
+    # from the attached data downstream (gfp_threshold.detect_gfp_class), so new
+    # subjects are supported.  Missing feature data raises a clear error there.
     s = load_subject(sid)
     info = analyze_subject(s)
     cz_surf, hcr_surf = info["cz_surface"], info["hcr_surface"]
@@ -881,8 +899,8 @@ def estimate_sxy_roi_area_slab(
     print(f"  [{sid}] med_hcr={med_hcr:.1f}µm² med_cz={med_cz:.1f}µm² "
           f"sxy_slab_ok={sxy_med:.4f}")
 
-    fit = fit_anisotropic_similarity(*landmark_pairs_um(s, active_only=True))
-    sxy_gt = float(np.sqrt(fit.scales[0] * fit.scales[1]))
+    _gt = _gt_aniso_fit(s)
+    sxy_gt = float(np.sqrt(_gt.scales[0] * _gt.scales[1])) if _gt is not None else float("nan")
 
     return {
         "sid": sid,
@@ -975,8 +993,9 @@ def estimate_sxy_min_rule(sid: str, strict_hcr_ids=None) -> dict:
         med_hcr, med_cz, n_hcr, n_cz, hcr_limited (bool), sxy_gt,
         err_pct_median, method="min_rule_2x_quarterfov"``.
     """
-    if sid not in (SPOT_SUBJECTS | INTENSITY_SUBJECTS):
-        raise ValueError(f"{sid}: unknown subject")
+    # No hardcoded subject-set gate: the GFP class (spot/intensity) is detected
+    # from the attached data downstream (gfp_threshold.detect_gfp_class), so new
+    # subjects are supported.  Missing feature data raises a clear error there.
     s = load_subject(sid)
     info = analyze_subject(s)
     cz_surf, hcr_surf = info["cz_surface"], info["hcr_surface"]
@@ -1030,8 +1049,8 @@ def estimate_sxy_min_rule(sid: str, strict_hcr_ids=None) -> dict:
             f"med_cz={med_cz}). Fall back to SXY_GRID_SEARCH_OFFSETS seed-scan.")
     sxy = float(np.sqrt(med_hcr / med_cz))
 
-    fit = fit_anisotropic_similarity(*landmark_pairs_um(s, active_only=True))
-    sxy_gt = float(np.sqrt(fit.scales[0] * fit.scales[1]))
+    _gt = _gt_aniso_fit(s)
+    sxy_gt = float(np.sqrt(_gt.scales[0] * _gt.scales[1])) if _gt is not None else float("nan")
 
     return {
         "sid": sid,
@@ -1091,8 +1110,9 @@ def estimate_sxy_auto(
         ``"slab_ok"``), ``sxy_gt``, ``err_pct_median``.  Additional keys
         from the underlying estimator are passed through.
     """
-    if sid not in (SPOT_SUBJECTS | INTENSITY_SUBJECTS):
-        raise ValueError(f"{sid}: unknown subject")
+    # No hardcoded subject-set gate: the GFP class (spot/intensity) is detected
+    # from the attached data downstream (gfp_threshold.detect_gfp_class), so new
+    # subjects are supported.  Missing feature data raises a clear error there.
 
     # Always run full_span first — it's cheap after the first call
     # because it uses cached tight bboxes and max-xsection.
@@ -1174,7 +1194,8 @@ def estimate_sz_roi_density(
       (ii) strict-GFP+ vs CZ-active cell-count matching — 07c showed
       integrated GFP+/truth ≈ 1.0, so bulk density should be unbiased.
     """
-    if sid not in SPOT_SUBJECTS:
+    from autocoreg.io.gfp_threshold import detect_gfp_class
+    if detect_gfp_class(sid) != "spot":
         raise ValueError(
             f"{sid}: intensity/unsupported subject — no HCR "
             "cell_body_segmentation/metrics.pickle"
@@ -1251,9 +1272,9 @@ def estimate_sz_roi_density(
         raise RuntimeError(f"{sid}: degenerate HCR density")
     sz_est = (rho_cz / rho_hcr) / (sxy ** 2)
 
-    fit_gt = fit_anisotropic_similarity(*landmark_pairs_um(s, active_only=True))
-    sxy_gt = float(np.sqrt(fit_gt.scales[0] * fit_gt.scales[1]))
-    sz_gt = float(fit_gt.scales[2])
+    _gt = _gt_aniso_fit(s)
+    sxy_gt = float(np.sqrt(_gt.scales[0] * _gt.scales[1])) if _gt is not None else float("nan")
+    sz_gt = float(_gt.scales[2]) if _gt is not None else float("nan")
 
     return {
         "sid": sid,
