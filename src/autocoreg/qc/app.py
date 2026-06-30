@@ -97,21 +97,15 @@ COLOR_LANDMARK     = (255, 255, 255, 200)  # white   (active landmark link line)
 COLOR_ADDED_LINK   = (0,   255, 0,   220)  # green   (session-added landmark link)
 
 
-# Export: fixed column order for the positions CSV / clipboard (BOTH coord frames).
-POS_COLS = [
-    "cz_id", "hcr_id", "soma_score",
-    "cz_native_z_um", "cz_native_y_um", "cz_native_x_um",
-    "cz_native_z_px", "cz_native_y_px", "cz_native_x_px",
-    "cz_in_hcr_z_um", "cz_in_hcr_y_um", "cz_in_hcr_x_um",
-    "hcr_z_um", "hcr_y_um", "hcr_x_um",
-    "hcr_z_px", "hcr_y_px", "hcr_x_px",
-]
-
-
-def _fmt_val(v):
-    if isinstance(v, float):
-        return "" if v != v else f"{v:.3f}"   # NaN -> ""
-    return str(v)
+from .positions import (
+    POS_COLS,
+    compute_centroids,
+    fmt_val as _fmt_val,
+    position_row as _position_row,
+    compute_pair_positions as _compute_pair_positions,
+    write_positions_csv as _write_positions_csv,
+    cz_world_from_seg as _cz_world_from_seg,
+)
 
 
 def parse_args(argv=None):
@@ -165,28 +159,6 @@ def find_final_round_csv(sid: str, variant: str) -> Path:
     if not rounds:
         raise FileNotFoundError(f"No matches CSVs under {d}")
     return rounds[-1]
-
-
-def compute_centroids(label_arr: np.ndarray, ids: list[int]) -> dict[int, np.ndarray]:
-    flat = label_arr.ravel()
-    mask = np.isin(flat, ids)
-    if not mask.any():
-        return {}
-    labels = flat[mask]
-    z_idx, y_idx, x_idx = np.unravel_index(np.flatnonzero(mask), label_arr.shape)
-    sums_z = np.bincount(labels, weights=z_idx, minlength=int(labels.max()) + 1)
-    sums_y = np.bincount(labels, weights=y_idx, minlength=int(labels.max()) + 1)
-    sums_x = np.bincount(labels, weights=x_idx, minlength=int(labels.max()) + 1)
-    counts = np.bincount(labels, minlength=int(labels.max()) + 1)
-    out = {}
-    for v in set(ids):
-        if v < len(counts) and counts[v] > 0:
-            out[int(v)] = np.array(
-                [sums_z[v] / counts[v],
-                 sums_y[v] / counts[v],
-                 sums_x[v] / counts[v]], dtype=float
-            )
-    return out
 
 
 def _make_lut(rgb):
@@ -477,14 +449,9 @@ class QCApp(QtWidgets.QMainWindow):
         unmatched_uniq = sorted(set(int(v) for v in np.unique(self.cz_unmatched_arr) if v != 0))
         matched_set = set(self.cz_matched_ids)
         self.unmatched_only = [v for v in unmatched_uniq if v not in matched_set]
-        all_cz = sorted(set(int(v) for v in np.unique(self.cz_matched_arr) if v != 0)
-                        | set(unmatched_uniq))
-        combo = np.where(self.cz_matched_arr > 0, self.cz_matched_arr, self.cz_unmatched_arr)
-        cz_centroids_vox = compute_centroids(combo, all_cz)
-        self.cz_world = {int(v): np.array([self.cz_bb["z_lo"] + c[0] * self.cz_vox,
-                                           self.cz_bb["y_lo"] + c[1] * self.cz_vox,
-                                           self.cz_bb["x_lo"] + c[2] * self.cz_vox])
-                         for v, c in cz_centroids_vox.items()}
+        self.cz_world = _cz_world_from_seg(
+            self.cz_matched_arr, self.cz_unmatched_arr, self.cz_bb, self.cz_vox
+        )
         s = load_subject(self.sid)
         cz_um, cz_ids = centroids_um(s, "cz")
         hcr_um, hcr_ids = centroids_um(s, "hcr_all")
@@ -2270,32 +2237,28 @@ class QCApp(QtWidgets.QMainWindow):
     # ---------------- export (positions + HCR seg crop) ----------------
     def _positions_for(self, cz_id) -> dict:
         """XYZ for a CZ ROI in BOTH frames: czstack-native (µm + px), CZ warped into
-        HCR µm, and the matched HCR cell (HCR µm + px). Missing parts omitted."""
+        HCR µm, and the matched HCR cell (HCR µm + px). Missing parts omitted.
+
+        cz_in_hcr comes from self._cz_pos (TPS-aware) so manual-match refits are
+        reflected.  A single-element dict wraps the one CZ so position_row can look
+        it up by id, matching the derived-dict contract.
+        """
         cz_id = int(cz_id)
-        hcr = self.cz_to_hcr.get(cz_id)
-        d = {"cz_id": cz_id,
-             "hcr_id": int(hcr) if hcr is not None else -1,
-             "soma_score": float(self.cz_to_soma.get(cz_id, float("nan")))}
-        cn = self.cz_native_by_id.get(cz_id)
-        if cn is not None:
-            d.update(cz_native_z_um=float(cn[0]), cz_native_y_um=float(cn[1]),
-                     cz_native_x_um=float(cn[2]),
-                     cz_native_z_px=cn[0] / self.cz_z_um,
-                     cz_native_y_px=cn[1] / self.cz_xy_um,
-                     cz_native_x_px=cn[2] / self.cz_xy_um)
-        cw = self._cz_pos(cz_id)
-        if cw is not None:
-            d.update(cz_in_hcr_z_um=float(cw[0]), cz_in_hcr_y_um=float(cw[1]),
-                     cz_in_hcr_x_um=float(cw[2]))
-        if hcr is not None:
-            hp = self.hcr_by_id.get(int(hcr))
-            if hp is not None:
-                d.update(hcr_z_um=float(hp[0]), hcr_y_um=float(hp[1]),
-                         hcr_x_um=float(hp[2]),
-                         hcr_z_px=hp[0] / self.hcr_z_um,
-                         hcr_y_px=hp[1] / self.hcr_xy_um,
-                         hcr_x_px=hp[2] / self.hcr_xy_um)
-        return d
+        derived = {
+            "cz_native_by_id": self.cz_native_by_id,
+            "cz_in_hcr_by_id": {cz_id: self._cz_pos(cz_id)},
+            "hcr_by_id": self.hcr_by_id,
+            "cz_xy_um": self.cz_xy_um,
+            "cz_z_um": self.cz_z_um,
+            "hcr_xy_um": self.hcr_xy_um,
+            "hcr_z_um": self.hcr_z_um,
+        }
+        return _position_row(
+            cz_id,
+            self.cz_to_hcr.get(cz_id),
+            self.cz_to_soma.get(cz_id, float("nan")),
+            derived,
+        )
 
     def _copy_positions(self):
         d = self._positions_for(self.cur_cz_id)
@@ -2307,13 +2270,22 @@ class QCApp(QtWidgets.QMainWindow):
 
     def _export_all_positions(self):
         out = self.export_dir / f"positions_{self.sid}.csv"
-        rows = [self._positions_for(c) for c in self.cz_order]
-        with open(out, "w") as f:
-            f.write(",".join(POS_COLS) + "\n")
-            for d in rows:
-                f.write(",".join(_fmt_val(d.get(c, "")) for c in POS_COLS) + "\n")
-        self._set_export_status(f"wrote {len(rows)} positions → {out.name}")
-        print(f"[export] {len(rows)} positions -> {out}")
+        # Build cz_in_hcr_by_id using _cz_pos (TPS-aware) for the full queue so
+        # manual-match refits are reflected in every row.
+        derived = {
+            "cz_native_by_id": self.cz_native_by_id,
+            "cz_in_hcr_by_id": {c: self._cz_pos(c) for c in self.cz_order},
+            "hcr_by_id": self.hcr_by_id,
+            "cz_xy_um": self.cz_xy_um,
+            "cz_z_um": self.cz_z_um,
+            "hcr_xy_um": self.hcr_xy_um,
+            "hcr_z_um": self.hcr_z_um,
+        }
+        df = _compute_pair_positions(self.cz_to_hcr, self.cz_to_soma, derived,
+                                     cz_ids=self.cz_order)
+        _write_positions_csv(df, out)
+        self._set_export_status(f"wrote {len(df)} positions → {out.name}")
+        print(f"[export] {len(df)} positions -> {out}")
 
     def _export_hcr_seg_crop(self):
         """Raw HCR segmentation labels cropped ±cube_half µm around the current pair
