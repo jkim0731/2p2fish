@@ -71,7 +71,12 @@ def strict_gfp_ids(sid: str) -> tuple[set[int], dict]:
             tbl = df[["hcr_id", "density"]].dropna()
         else:
             from autocoreg.io.subjects import _aggregate_spots_from_hcr
-            agg = _aggregate_spots_from_hcr(Path(s.hcr_dir))
+            # 488 spots come from the GFP round (may be R2, e.g. 755252/767022) — NOT the seg dir.
+            agg = _aggregate_spots_from_hcr(Path(s.gfp_hcr_dir))
+            if agg is None or len(agg) == 0:
+                raise RuntimeError(
+                    f"{sid}: no 488 spots in the GFP-round dir {Path(s.gfp_hcr_dir).name} "
+                    f"(strict_gfp_ids density path). If spots are in a different round, set gfp_round.")
             tbl = agg[["hcr_id", "density"]].dropna()
         keep = tbl[tbl["density"].astype(float) >= cutoff]
     elif feature == "mean_minus_bg":

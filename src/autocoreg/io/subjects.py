@@ -336,7 +336,23 @@ def _load_hcr_centroids(hcr_dir: Path, coreg_dir: Path) -> pd.DataFrame:
 # -----------------------------------------------------------
 # GFP+ loader
 # -----------------------------------------------------------
+# Per-run memo: the 488 spots.csv can be ~0.5 GB and is aggregated identically by several callers
+# (load_subject's hcr_gfp_df, gfp_threshold._load_spot_feature / analyze_subject, inputs.strict_gfp_ids)
+# and across the MANY load_subject() calls in a single pipeline run. Read + aggregate ONCE per
+# directory; hand each caller a fresh copy so it can filter/mutate without corrupting the cache.
+_SPOTS_AGG_CACHE: dict = {}
+
+
 def _aggregate_spots_from_hcr(hcr_dir: Path) -> pd.DataFrame | None:
+    """Memoized (per directory) wrapper around :func:`_aggregate_spots_from_hcr_impl`."""
+    key = str(hcr_dir)
+    if key not in _SPOTS_AGG_CACHE:
+        _SPOTS_AGG_CACHE[key] = _aggregate_spots_from_hcr_impl(hcr_dir)
+    cached = _SPOTS_AGG_CACHE[key]
+    return None if cached is None else cached.copy()
+
+
+def _aggregate_spots_from_hcr_impl(hcr_dir: Path) -> pd.DataFrame | None:
     """Fallback used when a subject does not have a pre-aggregated
     `*_spot_488_counts.csv`. Mirrors `step_2_automatic_mapping_for_qc.ipynb`:
         1. Read `image_spot_detection/channel_488_spots/spots.csv`
