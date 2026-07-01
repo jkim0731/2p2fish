@@ -177,6 +177,10 @@ def parse_args(argv=None):
                    help="Explicit matcher-output CSV (cz_id,hcr_id[,soma_score]). "
                         "Overrides the find_final_round_csv lookup under "
                         "MFISH_QC_MATCHES_DIR.")
+    p.add_argument("--fish-name", dest="fish_name", default="FISH (GFP)",
+                   help="Display name for the HCR fluorescence image (was '488').")
+    p.add_argument("--twop-name", dest="twop_name", default="2p z-stack (GCaMP)",
+                   help="Display name for the 2p z-stack image (was 'CZ img').")
     return p.parse_args(argv)
 
 
@@ -338,7 +342,8 @@ class QCApp(QtWidgets.QMainWindow):
     def __init__(self, sid: str, variant: str, cube_um: float, start: int,
                  hcr_level: int = HCR_LEVEL, cz_list_path: str | None = None,
                  matches_csv: str | None = None, final_pairs_path: str | None = None,
-                 sort_mode: str = "soma_desc", worst_pct: float | None = None):
+                 sort_mode: str = "soma_desc", worst_pct: float | None = None,
+                 hcr_image_name: str = "FISH (GFP)", cz_image_name: str = "2p z-stack (GCaMP)"):
         super().__init__()
         self.sid = sid
         self.variant = variant
@@ -349,6 +354,9 @@ class QCApp(QtWidgets.QMainWindow):
         self.final_pairs_path = final_pairs_path
         self.sort_mode = sort_mode          # soma_desc | soma_asc | matcher
         self.worst_pct = worst_pct          # None = full queue
+        # Editable display names for the two background images (HCR fluorescence + 2p z-stack).
+        self.hcr_image_name = hcr_image_name
+        self.cz_image_name = cz_image_name
         self.setWindowTitle(f"QC Qt — {sid} / {variant}")
         self._load_data()
         self._init_state()
@@ -752,6 +760,10 @@ class QCApp(QtWidgets.QMainWindow):
         self.col_other_hcru = COLOR_OTHER_HCRU
         self.col_fail_gfp = COLOR_HCR_FAIL_GFP
         self.col_fail_cls = COLOR_HCR_FAIL_CLS
+        # Image colormaps (single-hue black→color LUTs, right for additive overlay).  Match
+        # CubeView's defaults: FISH green, 2p z-stack red.  Right-click an image toggle to change.
+        self.lut_rgb_hcr = (0, 255, 0)
+        self.lut_rgb_cz = (255, 0, 0)
         self.batch_accept_mode = False  # MIP left-click accept (function 3)
         self._id_text_item = None     # ephemeral on-image ROI-ID text (right-click)
         self.mip_mode = False  # toggled by 'm' / radio
@@ -966,6 +978,18 @@ class QCApp(QtWidgets.QMainWindow):
         if cc is not None:                       # re-center the orthoview crosshair on it too
             self.cur_y_world = float(cc[1])
             self.cur_x_world = float(cc[2])
+        # Jump the displayed z-slice to the matched HCR cell so its white contour is visible
+        # right away (the current slice may not intersect it -> no feedback otherwise).
+        hc_c = self.hcr_by_id.get(hc)
+        if hc_c is not None:
+            self.cur_z_world = float(hc_c[0])
+            if hasattr(self, "z_slider"):
+                step = int(round((self.cur_z_world - self.cube_bb["z_lo"]) / self.hcr488_voxel[0]))
+                self.z_slider.blockSignals(True)
+                self.z_slider.setValue(max(0, min(step, self.z_slider.maximum())))
+                self.z_slider.blockSignals(False)
+            if hasattr(self, "lbl_z"):
+                self.lbl_z.setText(f"{self.cur_z_world:.0f}")
         self._set_match_status(self._counts_summary() + "  (added, TPS refit)")
         self._notify(f"✓ manual cz{cz} ↔ hcr{hc}   (QC'd: {len(self.labels_state)})",
                      kind="ok")
@@ -1244,8 +1268,12 @@ class QCApp(QtWidgets.QMainWindow):
                                   "Scroll a side view to move its plane. Shortcut: `")
         self.btn_ortho.toggled.connect(lambda _=0: self._toggle_side_views())
         bar.addWidget(self.btn_ortho)
-        self.chk_hcr488 = _tb("488 (q)", True, self._toggle_hcr488, "HCR 488 image")
-        self.chk_czw = _tb("CZ img (w)", True, self._toggle_czw, "CZ warped image")
+        # Image toggles: 2p z-stack first (q), FISH second (w).  Right-click either to change
+        # its colormap.  Names are editable via the hcr_image_name / cz_image_name args.
+        self.chk_czw = _tb(f"{self.cz_image_name} (q)", True, self._toggle_czw,
+                           f"{self.cz_image_name} image — right-click to change colormap")
+        self.chk_hcr488 = _tb(f"{self.hcr_image_name} (w)", True, self._toggle_hcr488,
+                              f"{self.hcr_image_name} image — right-click to change colormap")
         self.chk_cur_cz = _tb("pair CZ (z)", True, self._toggle_cur_cz)
         self.chk_cur_hcr = _tb("pair HCR (x)", True, self._toggle_cur_hcr)
         self.chk_other_cz = _tb("other CZ (c)", True, self._toggle_other_cz)
@@ -1255,6 +1283,11 @@ class QCApp(QtWidgets.QMainWindow):
         self.chk_qc_markers = _tb("markers (m)", True, self._toggle_qc_markers,
                                   "QC'd pair dots: good=green, bad=red, unsure=yellow")
         self._setup_color_checkboxes()   # tint contour checkboxes + right-click color editing
+        # Right-click an image toggle to change its colormap.
+        for chk, which in ((self.chk_czw, "cz"), (self.chk_hcr488, "hcr")):
+            chk.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+            chk.customContextMenuRequested.connect(
+                lambda _pos, w=which: self._on_image_cmap_menu(w))
         bar.addStretch(1)
         lv.addLayout(bar)
         # Image area (radiological orthoview grid), so the shared axes line up pixel-for-pixel:
@@ -1342,23 +1375,27 @@ class QCApp(QtWidgets.QMainWindow):
         # Contrast widgets (compact): histogram + region + min/max spinboxes
         # + Auto button.  Auto re-derives 5/99.5 percentiles from the current
         # cube; drag region or type to override.
-        self.hist_hcr, self.spin_hcr_min, self.spin_hcr_max, self.btn_hcr_auto = \
-            self._build_contrast_panel(
-                pl, label="HCR 488", img=self.view.img_hcr,
-                gradient_rgb=(0, 255, 0),
-                auto_fn=lambda: self._auto_contrast("hcr"),
-            )
+        # 2p z-stack first, then FISH (matches the swapped toolbar order).  Initial gradients
+        # = the default colormaps (2p red, FISH green); right-click the image toggle to change.
         self.hist_cz, self.spin_cz_min, self.spin_cz_max, self.btn_cz_auto = \
             self._build_contrast_panel(
-                pl, label="CZ warped", img=self.view.img_cz,
-                gradient_rgb=(255, 0, 0),
+                pl, label=self.cz_image_name, img=self.view.img_cz,
+                gradient_rgb=self.lut_rgb_cz,
                 auto_fn=lambda: self._auto_contrast("cz"),
             )
-        # The histograms drive the MAIN image's levels (setImageItem); the side views only
-        # picked them up on a full redraw, so live contrast drags didn't reach XZ/YZ.  Mirror
-        # the main image's levels onto the side views whenever a histogram changes.
+        self.hist_hcr, self.spin_hcr_min, self.spin_hcr_max, self.btn_hcr_auto = \
+            self._build_contrast_panel(
+                pl, label=self.hcr_image_name, img=self.view.img_hcr,
+                gradient_rgb=self.lut_rgb_hcr,
+                auto_fn=lambda: self._auto_contrast("hcr"),
+            )
+        # The histograms drive the MAIN image's levels + LUT (setImageItem); the side views only
+        # picked them up on a full redraw, so live contrast/colormap changes didn't reach XZ/YZ.
+        # Mirror the main image's levels + LUT onto the side views whenever a histogram changes.
         self.hist_hcr.sigLevelsChanged.connect(lambda *_: self._sync_side_levels())
         self.hist_cz.sigLevelsChanged.connect(lambda *_: self._sync_side_levels())
+        self.hist_hcr.sigLookupTableChanged.connect(lambda *_: self._sync_side_luts())
+        self.hist_cz.sigLookupTableChanged.connect(lambda *_: self._sync_side_luts())
 
         # View mode: slice / MIP.  (Image/ROI toggle checkboxes are in the top toolbar.)
         mode_box = QtWidgets.QGroupBox("View mode")
@@ -1517,8 +1554,8 @@ class QCApp(QtWidgets.QMainWindow):
         self._mk_shortcut("p", self._copy_positions)
         # 4 selects "visible" on unmatched ROIs (no-op on matched).
         self._mk_shortcut("4", lambda: self._radio_key(4))
-        self._mk_shortcut("q", lambda: self.chk_hcr488.toggle())  # q → 488 image
-        self._mk_shortcut("w", lambda: self.chk_czw.toggle())     # w → warped CZ image
+        self._mk_shortcut("q", lambda: self.chk_czw.toggle())     # q → 2p z-stack (GCaMP)
+        self._mk_shortcut("w", lambda: self.chk_hcr488.toggle())  # w → FISH (GFP)
         self._mk_shortcut("m", lambda: self.chk_qc_markers.toggle())  # m → QC'd markers
         self._mk_shortcut("s", lambda: self.rad_slice.setChecked(True))
         self._mk_shortcut("d", lambda: self.rad_mip.setChecked(True))  # d → MIP cube
@@ -2281,8 +2318,10 @@ class QCApp(QtWidgets.QMainWindow):
         if which == "cz":
             origin3 = (self.cz_bb["z_lo"], self.cz_bb["y_lo"], self.cz_bb["x_lo"])
             vox3 = (self.cz_vox, self.cz_vox, self.cz_vox)
+            # (arr, color, gated): gated=True honors show_other; False = always drawn.
             sources = [(self.cz_matched_arr, self.col_other_czm, True),
                        (self.cz_unmatched_arr, self.col_other_czu, True)]
+            cur_scan = [self.cz_matched_arr, self.cz_unmatched_arr]
             show_other = self.show_other_cz
             cur_id = self.cur_cz_id if self.show_cur_cz else None
             cur_color = self.col_cur_cz
@@ -2291,12 +2330,17 @@ class QCApp(QtWidgets.QMainWindow):
             vox3 = (self.hcr_vox_z, self.hcr_vox_xy, self.hcr_vox_xy)
             sources = [(self.hcr_matched_arr, self.col_other_hcrm, True),
                        (self.hcr_unmatched_arr, self.col_other_hcru, True)]
-            # Failed arrays (eligible=False): drawn only when their toggle is on, never
-            # "other"-gated, and never eligible for the current-ROI highlight.
             if self.show_hcr_fail_gfp and self.hcr_failed_gfp_arr is not None:
                 sources.append((self.hcr_failed_gfp_arr, self.col_fail_gfp, False))
             if self.show_hcr_fail_cls and self.hcr_failed_cls_arr is not None:
                 sources.append((self.hcr_failed_cls_arr, self.col_fail_cls, False))
+            # Current-HCR highlight scans ALL hcr arrays — incl. failed-GFP / failed-classifier /
+            # non-pool cells the operator can manually match (the HCR pick falls back to
+            # hcr_by_id, which includes them).  So a manual match ALWAYS turns white, not just
+            # for pool cells — this is the critical add-match visual feedback.
+            cur_scan = [a for a in (self.hcr_matched_arr, self.hcr_unmatched_arr,
+                                    self.hcr_failed_gfp_arr, self.hcr_failed_cls_arr)
+                        if a is not None]
             show_other = self.show_other_hcr
             cur_id = self.cur_hcr_id if (self.show_cur_hcr and self.cur_matched) else None
             cur_color = self.col_cur_hcr
@@ -2304,22 +2348,26 @@ class QCApp(QtWidgets.QMainWindow):
         arr0 = sources[0][0]
         H, W = int(arr0.shape[ra]), int(arr0.shape[ca])
         rgba = np.zeros((H, W, 4), dtype=np.uint8)
-        cur_bnd = np.zeros((H, W), dtype=bool)   # current-ROI boundary, accumulated then on top
-        for arr, color, eligible in sources:
+        # "Other" edges: matched/unmatched honor show_other; failed always drawn.  The current
+        # ROI is excluded here (it gets the highlight color below), regardless of which array.
+        for arr, color, gated in sources:
+            if gated and not show_other:
+                continue
             L = self._plane2d(arr, origin3, vox3, view)
             if L is None or L.shape != (H, W):
                 continue
             b = self._boundary_mask(L)
-            if eligible and cur_id is not None:
-                here_cur = (L == cur_id)
-                cur_bnd |= (b & here_cur)
-                b_other = b & (~here_cur)
-            else:
-                b_other = b
-            # matched/unmatched "other" edges honor show_other; failed arrays always draw.
-            if (not eligible) or show_other:
-                self._paint_edge(rgba, b_other, color)
+            if cur_id is not None:
+                b = b & (L != cur_id)
+            self._paint_edge(rgba, b, color)
+        # Current-ROI highlight, painted LAST (on top), found in whichever array holds it.
         if cur_id is not None:
+            cur_bnd = np.zeros((H, W), dtype=bool)
+            for arr in cur_scan:
+                L = self._plane2d(arr, origin3, vox3, view)
+                if L is None or L.shape != (H, W):
+                    continue
+                cur_bnd |= (self._boundary_mask(L) & (L == cur_id))
             self._paint_edge(rgba, cur_bnd, cur_color)
         return rgba, origin3[ca], origin3[ra], vox3[ca], vox3[ra]
 
@@ -2402,6 +2450,21 @@ class QCApp(QtWidgets.QMainWindow):
             w.img_hcr.setLevels(lv_hcr)
             w.img_cz.setLevels(lv_cz)
 
+    def _sync_side_luts(self):
+        """Mirror the main images' colormaps (LUTs) onto the side views — called when a
+        histogram's colormap changes (menu preset or direct gradient edit).  The LUT array
+        comes from the histogram (ImageItem.lut is a method in pyqtgraph 0.14, not the array)."""
+        if not self.show_side_views:
+            return
+        for hist, attr in ((self.hist_hcr, "img_hcr"), (self.hist_cz, "img_cz")):
+            try:
+                lut = hist.getLookupTable(n=256)
+            except Exception:
+                continue
+            if lut is not None:
+                for w in (self.view_xz, self.view_yz):
+                    getattr(w, attr).setLookupTable(lut)
+
     def _redraw_side_views(self):
         """Refresh the XZ + YZ side panels (background images + edge overlays) and crosshairs.
         No-op when the orthoview is off.  Cheap: same in-RAM slice + vectorized boundary pass as
@@ -2439,6 +2502,7 @@ class QCApp(QtWidgets.QMainWindow):
             # XY-only; the edge builder is mode-independent, so side views work in both modes).
             w.clear_contours()
             self._draw_edges(view, w)
+        self._sync_side_luts()      # match the current image colormaps
         self._update_crosshairs()
 
     @staticmethod
@@ -2642,6 +2706,40 @@ class QCApp(QtWidgets.QMainWindow):
         for label, attr in entries:
             menu.addAction(label, lambda a=attr: self._pick_color(a))
         menu.exec_(QtGui.QCursor.pos())
+
+    # Single-hue colormap presets (black→color) — right for additive image overlay.
+    _CMAP_PRESETS = [("Green", (0, 255, 0)), ("Red", (255, 0, 0)), ("Blue", (40, 120, 255)),
+                     ("Magenta", (255, 0, 255)), ("Cyan", (0, 255, 255)), ("Yellow", (255, 255, 0)),
+                     ("Orange", (255, 140, 0)), ("Gray", (255, 255, 255))]
+
+    def _on_image_cmap_menu(self, which):
+        name = self.hcr_image_name if which == "hcr" else self.cz_image_name
+        menu = QtWidgets.QMenu(self)
+        menu.addSection(f"{name} colormap")
+        for label, rgb in self._CMAP_PRESETS:
+            menu.addAction(label, lambda r=rgb: self._set_image_cmap(which, r))
+        menu.addSeparator()
+        menu.addAction("Custom…", lambda: self._pick_image_cmap(which))
+        menu.exec_(QtGui.QCursor.pos())
+
+    def _pick_image_cmap(self, which):
+        cur = self.lut_rgb_hcr if which == "hcr" else self.lut_rgb_cz
+        c = QtWidgets.QColorDialog.getColor(QtGui.QColor(*cur), self, "Image colormap (max color)")
+        if c.isValid():
+            self._set_image_cmap(which, (c.red(), c.green(), c.blue()))
+
+    def _set_image_cmap(self, which, rgb):
+        """Set an image's single-hue colormap (black→rgb).  Drives the main image via the
+        histogram gradient; the sigLookupTableChanged hook mirrors it onto the side views."""
+        rgb = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+        hist = self.hist_hcr if which == "hcr" else self.hist_cz
+        if which == "hcr":
+            self.lut_rgb_hcr = rgb
+        else:
+            self.lut_rgb_cz = rgb
+        hist.gradient.restoreState(
+            {"mode": "rgb", "ticks": [(0.0, (0, 0, 0, 255)), (1.0, (rgb[0], rgb[1], rgb[2], 255))]})
+        self._sync_side_luts()   # belt-and-suspenders (also fires via sigLookupTableChanged)
 
     def _pick_color(self, attr):
         cur = getattr(self, attr)
@@ -3110,7 +3208,8 @@ def launch(sid: str, variant: str = "step3_v3_anchor_vote_wang_end",
            cube_um: float = CUBE_HALF_UM, start: int = 0, hcr_level: int = HCR_LEVEL,
            cz_list_path: str | None = None, matches_csv: str | None = None,
            final_pairs_path: str | None = None, sort_mode: str = "soma_desc",
-           worst_pct: float | None = None):
+           worst_pct: float | None = None,
+           hcr_image_name: str = "FISH (GFP)", cz_image_name: str = "2p z-stack (GCaMP)"):
     """Build the QC window and return (QApplication, QCApp) without entering the
     event loop.  Callers that want a blocking GUI call ``app.exec_()`` after."""
     # World-writable outputs: /scratch is shared across uids (the GUI often runs as
@@ -3120,7 +3219,8 @@ def launch(sid: str, variant: str = "step3_v3_anchor_vote_wang_end",
     win = QCApp(sid, variant, cube_um, start, hcr_level,
                 cz_list_path=cz_list_path, matches_csv=matches_csv,
                 final_pairs_path=final_pairs_path, sort_mode=sort_mode,
-                worst_pct=worst_pct)
+                worst_pct=worst_pct,
+                hcr_image_name=hcr_image_name, cz_image_name=cz_image_name)
     win.show()
     return app, win
 
@@ -3131,7 +3231,8 @@ def main(argv=None):
                        args.level, cz_list_path=args.cz_list,
                        matches_csv=args.matches_csv,
                        final_pairs_path=args.final_pairs, sort_mode=args.sort,
-                       worst_pct=args.worst_pct)
+                       worst_pct=args.worst_pct,
+                       hcr_image_name=args.fish_name, cz_image_name=args.twop_name)
     sys.exit(app.exec_())
 
 
