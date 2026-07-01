@@ -1010,6 +1010,7 @@ class QCApp(QtWidgets.QMainWindow):
         so the red CZ image + its outlines reflect the manual landmarks (adding a landmark
         alone only moves the CZ centroid markers).  On-demand: it is a full volume resample.
         Restored to the baked warp on relaunch (the .tif files on disk are untouched)."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         from scipy.interpolate import Rbf
         from scipy.ndimage import map_coordinates
         pairs = [(c, h) for c, h in self.active_pairs.items()
@@ -1021,9 +1022,8 @@ class QCApp(QtWidgets.QMainWindow):
         bb, vox = self.cz_bb, self.cz_vox
         z_lo, y_lo, x_lo = bb["z_lo"], bb["y_lo"], bb["x_lo"]
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        self.btn_rewarp.setEnabled(False)   # guard against re-entry during processEvents()
         try:
-            self._notify(f"re-warping CZ view through {len(pairs)} landmarks…", kind="info")
-            QtWidgets.QApplication.processEvents()
             # Inverse TPS: HCR µm -> CZ-native µm (per build_artifacts._fit_inverse_tps).
             hcr = np.array([self.hcr_by_id[h] for _, h in pairs], dtype=float)       # (N,3) zyx
             czn = np.array([self.cz_native_by_id[c] for c, _ in pairs], dtype=float)  # (N,3) zyx
@@ -1045,20 +1045,55 @@ class QCApp(QtWidgets.QMainWindow):
             Y_flat, X_flat = Y.ravel(), X.ravel()
             warped_cz = np.zeros((nz, ny, nx), dtype=np.int32)
             warped_img = np.zeros((nz, ny, nx), dtype=np.float32)
-            for k in range(nz):
-                z = z_lo + (k + 0.5) * vox
-                Z_flat = np.full_like(Y_flat, z)
-                cz_z = rbf[0](Z_flat, Y_flat, X_flat) / self.cz_z_um
-                cz_y = rbf[1](Z_flat, Y_flat, X_flat) / self.cz_xy_um
-                cz_x = rbf[2](Z_flat, Y_flat, X_flat) / self.cz_xy_um
-                coords = np.stack([cz_z, cz_y, cz_x])
-                warped_cz[k] = map_coordinates(
-                    cz_seg, coords, order=0, mode="constant", cval=0).reshape(ny, nx)
-                warped_img[k] = map_coordinates(
-                    cz_vol, coords, order=1, mode="constant", cval=0.0).reshape(ny, nx)
-                if k % 8 == 0:
-                    self._notify(f"re-warping CZ view… z {k + 1}/{nz}", kind="info")
+
+            # The scipy Rbf eval is O(query_pts × landmark_nodes); with active_pairs = the whole
+            # match set (hundreds of nodes) × many z-slices it is the bottleneck.  Parallelize
+            # over z-slices with THREADS (not fork — unsafe inside a Qt GUI): the Rbf distance/
+            # kernel eval + map_coordinates are numpy/scipy C ops that release the GIL, so threads
+            # scale.  Each z-slice writes a disjoint row of the shared output arrays.
+            def _warp_chunk(ks):
+                for k in ks:
+                    z = z_lo + (k + 0.5) * vox
+                    Z_flat = np.full_like(Y_flat, z)
+                    cz_z = rbf[0](Z_flat, Y_flat, X_flat) / self.cz_z_um
+                    cz_y = rbf[1](Z_flat, Y_flat, X_flat) / self.cz_xy_um
+                    cz_x = rbf[2](Z_flat, Y_flat, X_flat) / self.cz_xy_um
+                    coords = np.stack([cz_z, cz_y, cz_x])
+                    warped_cz[k] = map_coordinates(
+                        cz_seg, coords, order=0, mode="constant", cval=0).reshape(ny, nx)
+                    warped_img[k] = map_coordinates(
+                        cz_vol, coords, order=1, mode="constant", cval=0.0).reshape(ny, nx)
+                return len(ks)
+
+            n_workers = int(os.environ.get("MFISH_QC_WARP_WORKERS", max(1, (os.cpu_count() or 4) - 2)))
+            n_workers = max(1, min(n_workers, nz))
+            chunk = max(1, (nz + n_workers * 3 - 1) // (n_workers * 3))  # a few chunks per worker
+            chunks = [range(i, min(i + chunk, nz)) for i in range(0, nz, chunk)]
+            # Pin inner BLAS/OpenBLAS to 1 thread: our ThreadPoolExecutor already provides the
+            # parallelism, and each worker's np.dot otherwise spawns its own BLAS thread pool
+            # (16 threads) → 14×16 oversubscription that cripples scaling.  Measured: this turns
+            # ~2.8× (oversubscribed) into ~8× on 14 workers.  No-op if threadpoolctl is absent.
+            try:
+                import threadpoolctl
+                _blas_ctx = threadpoolctl.threadpool_limits(limits=1)
+            except Exception:
+                import contextlib
+                _blas_ctx = contextlib.nullcontext()
+            t0 = time.perf_counter()
+            self._notify(f"re-warping CZ view: {nz}z × {ny}×{nx}, {len(pairs)} landmarks, "
+                         f"{n_workers} threads…", kind="info")
+            QtWidgets.QApplication.processEvents()
+            done = 0
+            with _blas_ctx, ThreadPoolExecutor(max_workers=n_workers) as ex:
+                futs = [ex.submit(_warp_chunk, ks) for ks in chunks]
+                for fut in as_completed(futs):
+                    done += fut.result()
+                    self._notify(f"re-warping CZ view… {done}/{nz} z", kind="info")
                     QtWidgets.QApplication.processEvents()
+            dt = time.perf_counter() - t0
+            if PROFILE:
+                print(f"[qc-profile] re-warp {nz}z×{ny}×{nx}, {len(pairs)} nodes, "
+                      f"{n_workers} threads: {dt:.1f}s")
             # Split by the CURRENT matched set (manual adds updated cz_to_hcr) + replace.
             matched_cz_ids = np.fromiter(
                 (int(c) for c in self.cz_to_hcr.keys()), dtype=np.int32)
@@ -1072,9 +1107,10 @@ class QCApp(QtWidgets.QMainWindow):
                                float(np.percentile(warped_img, AUTO_CLIP_HI)))
             self._edge_cache.clear()   # CZ seg changed → drop cached edge overlays
             self._redraw()
-            self._notify(f"✓ CZ view re-warped through {len(pairs)} landmarks "
+            self._notify(f"✓ CZ view re-warped through {len(pairs)} landmarks in {dt:.1f}s "
                          f"(relaunch to restore baked warp)", kind="ok")
         finally:
+            self.btn_rewarp.setEnabled(True)
             QtWidgets.QApplication.restoreOverrideCursor()
 
     def _counts_summary(self) -> str:
