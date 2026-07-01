@@ -57,6 +57,7 @@ import datetime as _dt
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import cv2
@@ -93,7 +94,16 @@ AUTO_CLIP_HI = float(os.environ.get("MFISH_QC_CLIP_HI", "99.9"))
 #   "vector" — legacy: one pyqtgraph PlotDataItem per ROI contour, re-extracted (cv2.findContours)
 #            on every pan/zoom/slice. Kept as a fallback (set MFISH_QC_CONTOUR_MODE=vector).
 CONTOUR_MODE = os.environ.get("MFISH_QC_CONTOUR_MODE", "image").strip().lower()
-EDGE_PX = int(os.environ.get("MFISH_QC_EDGE_PX", "1"))  # boundary half-width in data px (dilation)
+# Boundary thickness in *data* pixels (voxels), added by dilation. NOTE: unlike the legacy
+# vector contours (whose pen width was a constant number of *screen* px regardless of zoom),
+# an image-overlay edge is a fixed number of *data* px, so it magnifies as you zoom in.
+# Default 0 = a crisp 1-voxel rim (thinnest, closest to the old look at normal zoom); raise to
+# 1/2 via MFISH_QC_EDGE_PX only if you want a heavier line.
+EDGE_PX = int(os.environ.get("MFISH_QC_EDGE_PX", "0"))
+# MFISH_QC_PROFILE=1 prints per-interaction wall-clock timings (full redraw, edge build,
+# pan/zoom) so we can tell whether the bottleneck is CPU (boundary extraction) or the
+# remote-display repaint.  Off by default (zero overhead when off).
+PROFILE = os.environ.get("MFISH_QC_PROFILE", "0").strip().lower() not in ("0", "", "false", "no")
 
 # Colors (RGBA, 0..255)
 COLOR_CUR_CZ     = (255, 255, 0,   255)  # yellow
@@ -1375,7 +1385,11 @@ class QCApp(QtWidgets.QMainWindow):
         so refresh only that — it is sparse scatter points, cheap to redraw.  In "vector" mode
         contours are viewport-clipped too, so the whole thing is re-extracted."""
         if CONTOUR_MODE == "image":
+            t0 = time.perf_counter() if PROFILE else 0.0
             self._draw_match_overlay()
+            if PROFILE:
+                print(f"[qc-profile] pan/zoom (markers only, no edge rebuild): "
+                      f"{1e3*(time.perf_counter()-t0):.1f} ms")
             return
         self._redraw_contours_only()
 
@@ -1641,6 +1655,7 @@ class QCApp(QtWidgets.QMainWindow):
             self._show_roi_ids_at(*self._last_rc_world)
 
     def _redraw(self):
+        _t_redraw0 = time.perf_counter() if PROFILE else 0.0
         self._clear_id_text()  # ROI-ID text is ephemeral: drop it when the image changes
         bb = self.cube_bb
         z_world = self.cur_z_world
@@ -1714,6 +1729,9 @@ class QCApp(QtWidgets.QMainWindow):
             self.view.plot.setXRange(cx - hx, cx + hx, padding=0)
             self.view.plot.setYRange(cy - hy, cy + hy, padding=0)
             self._viewport_set_for_idx = self.show_idx
+        if PROFILE:
+            print(f"[qc-profile] full redraw (mode={CONTOUR_MODE}, mip={self.mip_mode}): "
+                  f"{1e3*(time.perf_counter()-_t_redraw0):.1f} ms")
 
     def _viewport_xy_range(self):
         """Current visible XY range in world µm: ((y_lo, y_hi), (x_lo, x_hi))."""
@@ -2008,10 +2026,16 @@ class QCApp(QtWidgets.QMainWindow):
             key = self._edge_state_key(which)
             cached = self._edge_cache.get(key)
             if cached is None:
+                t0 = time.perf_counter() if PROFILE else 0.0
                 cached = self._edges_rgba_for_view(which)
                 if len(self._edge_cache) > 256:   # bound memory over a long session
                     self._edge_cache.clear()
                 self._edge_cache[key] = cached
+                if PROFILE:
+                    print(f"[qc-profile] edge build {which}: {1e3*(time.perf_counter()-t0):.1f} ms "
+                          f"(miss; cache={len(self._edge_cache)})")
+            elif PROFILE:
+                print(f"[qc-profile] edge {which}: cache hit")
             rgba, x_lo, y_lo, xy_um = cached
             self.view.set_edge_image(item, rgba, x_lo=x_lo, y_lo=y_lo, xy_um=xy_um)
 
