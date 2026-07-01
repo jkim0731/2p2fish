@@ -46,36 +46,33 @@ INTENSITY_SUBJECTS = {"755252", "767022"}
 def detect_gfp_class(sid: str) -> str:
     """Return the GFP-feature class for a subject: ``'spot'`` or ``'intensity'``.
 
-    The six benchmark subjects keep their hardcoded class (behaviour unchanged).
-    Any other subject (new / pipeline-monitor data) is classified from the
-    attached HCR data so the automated path needs no per-subject list edit:
-
-      * ``'spot'`` if a ``*spot_488_counts.csv`` is present in the coreg dir, or
-        the HCR processed asset carries 488 spot detection
-        (``image_spot_detection/channel_488_spots/spots.csv``);
-      * else ``'intensity'`` if a ``cell_data_mean_{sid}_R1.csv`` is present;
-      * else ``'spot'`` (the modern-HCR default — every recent HCR run produces
-        488 spot detection; if no feature is actually loadable, the downstream
-        ``analyze_subject`` / ``strict_gfp_df`` raise a clear error).
+    Order of precedence:
+      1. Hardcoded SPOT_SUBJECTS → 'spot' (fast path, no data read).
+      2. **DATA-DRIVEN spot** — if 488 spots are actually attached (a ``*spot_488_counts.csv``
+         in the coreg dir, or ``image_spot_detection/channel_488_spots/spots.csv`` in the
+         **GFP-round** HCR dir, which may be R2) → 'spot'. Checked BEFORE the intensity set so a
+         legacy INTENSITY subject that now has R2 spots (755252, 767022) is correctly 'spot'.
+      3. Hardcoded INTENSITY_SUBJECTS → 'intensity' (preserved for the benchmark when no spots
+         are attached — e.g. 755252/767022 with only R1 + the cell_data_mean CSV).
+      4. 'intensity' if a ``cell_data_mean_{sid}_R1.csv`` is present; else 'spot' (modern-HCR
+         default; downstream raises clearly if no feature is loadable).
 
     Detection uses cheap path-existence checks only (no large CSV reads).
     """
     if sid in SPOT_SUBJECTS:
         return "spot"
-    if sid in INTENSITY_SUBJECTS:
-        return "intensity"
-    hcr_dir = None
+    # (2) data-driven spot precedence — see docstring
     try:
         s = load_subject(sid)
         if list(Path(s.coreg_dir).glob("*spot_488_counts.csv")):
             return "spot"
-        hcr_dir = Path(s.hcr_dir)
+        if (Path(s.gfp_hcr_dir) / "image_spot_detection" / "channel_488_spots"
+                / "spots.csv").exists():
+            return "spot"
     except Exception:
-        hcr_dir = None
-    if hcr_dir is not None and (
-        hcr_dir / "image_spot_detection" / "channel_488_spots" / "spots.csv"
-    ).exists():
-        return "spot"
+        pass
+    if sid in INTENSITY_SUBJECTS:
+        return "intensity"
     for cand in (Path(DATA_DIR) / f"cell_data_mean_{sid}_R1.csv",
                  Path(_config.DATA_LEVEL) / f"cell_data_mean_{sid}_R1.csv"):
         if cand.exists():
@@ -232,9 +229,9 @@ def _load_spot_feature(sid: str) -> pd.DataFrame:
       2. ``_aggregate_spots_from_hcr`` fallback.
     """
     s = load_subject(sid)
-    # Use SubjectData paths: s.coreg_dir / s.hcr_dir
+    # coreg_dir for the pre-aggregated csv; the GFP round dir (may be R2) for raw 488 spots.
     coreg_dir = s.coreg_dir
-    hcr_dir = s.hcr_dir
+    hcr_dir = s.gfp_hcr_dir
     spot_files = list(Path(coreg_dir).glob("*spot_488_counts.csv"))
     if spot_files:
         df = pd.read_csv(spot_files[0])

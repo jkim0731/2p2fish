@@ -87,7 +87,10 @@ HCR_SEG_XY_DOWNSAMPLE = 4
 class SubjectData:
     subject_id: str
     coreg_dir: Path
-    hcr_dir: Path
+    hcr_dir: Path            # segmentation / centroids / channels (the seg round, usually R1)
+    gfp_hcr_dir: Path        # 488-spot (GFP) source; == hcr_dir unless MFISH_GFP_HCR_DIR overrides
+                             # it (e.g. 755252/767022, whose 488 spots are in R2, not R1). Spot
+                             # SEG_IDs are R1's shared cell labels, so density joins to hcr_id.
 
     # resolution in um/pixel for each modality in native pixel space
     cz_xy_um: float = CZ_XY_UM
@@ -200,6 +203,11 @@ def _find_coreg_dir(subject_id: str) -> Path:
 
 
 def _find_hcr_dir(subject_id: str) -> Path:
+    # Explicit override (the seg-round HCR dir) — used when >1 HCR processed asset is attached
+    # (e.g. R1 seg + R2 gfp), so the glob below can't disambiguate. Set by the autocoreg capsule.
+    env = os.environ.get("MFISH_HCR_DIR")
+    if env:
+        return Path(env)
     matches = sorted(DATA_DIR.glob(f"HCR_{subject_id}_*_processed_*"))
     # Exclude downstream-derived assets whose names embed the processed-asset name
     # and thus also match this glob — e.g. the Capsule-1 ROI-quality output asset
@@ -707,6 +715,10 @@ def load_subject(
     subject_id = str(subject_id)
     coreg_dir = _find_coreg_dir(subject_id)
     hcr_dir = _find_hcr_dir(subject_id)
+    # 488-spot (GFP) source dir. Defaults to the seg dir; MFISH_GFP_HCR_DIR points it at a
+    # different HCR round (e.g. R2 for 755252/767022) whose spots.csv SEG_IDs are R1's shared
+    # cell labels, so per-cell density still joins to hcr_id.
+    gfp_hcr_dir = Path(os.environ["MFISH_GFP_HCR_DIR"]) if os.environ.get("MFISH_GFP_HCR_DIR") else hcr_dir
 
     cz_xy, cz_z = _read_cz_resolution(subject_id)
     hcr_res = _read_hcr_resolution(hcr_dir)
@@ -718,7 +730,7 @@ def load_subject(
     cz = _load_cz_centroids(coreg_dir)
     hcr = _load_hcr_centroids(hcr_dir, coreg_dir)
     gfp_df, feat, source, effective_min, effective_frac = _load_gfp(
-        subject_id, coreg_dir, hcr_dir,
+        subject_id, coreg_dir, gfp_hcr_dir,   # 488 spots come from the GFP round (may be R2)
         n_hcr_total=len(hcr),
         gfp_min_spots=gfp_min_spots,
         gfp_threshold_method=gfp_threshold_method,
@@ -733,6 +745,7 @@ def load_subject(
         subject_id=subject_id,
         coreg_dir=coreg_dir,
         hcr_dir=hcr_dir,
+        gfp_hcr_dir=gfp_hcr_dir,
         cz_xy_um=cz_xy,
         cz_z_um=cz_z,
         hcr_xy_um=hcr_xy,
