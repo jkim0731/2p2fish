@@ -85,6 +85,16 @@ HCR_LEVEL = 2  # default pyramid level; --level overrides
 AUTO_CLIP_LO = float(os.environ.get("MFISH_QC_CLIP_LO", "5"))
 AUTO_CLIP_HI = float(os.environ.get("MFISH_QC_CLIP_HI", "99.9"))
 
+# ROI-boundary rendering mode:
+#   "image"  (default) — draw ALL ROI boundaries for the slice as ONE cached RGBA ImageItem
+#            per view (edge overlay). Zoom/pan needs NO rebuild (pyqtgraph transforms the
+#            ImageItem); slices are cached; the per-slice build is a single vectorized boundary
+#            pass (no per-ROI cv2.findContours). Fixes the zoom/pan/slice clunkiness.
+#   "vector" — legacy: one pyqtgraph PlotDataItem per ROI contour, re-extracted (cv2.findContours)
+#            on every pan/zoom/slice. Kept as a fallback (set MFISH_QC_CONTOUR_MODE=vector).
+CONTOUR_MODE = os.environ.get("MFISH_QC_CONTOUR_MODE", "image").strip().lower()
+EDGE_PX = int(os.environ.get("MFISH_QC_EDGE_PX", "1"))  # boundary half-width in data px (dilation)
+
 # Colors (RGBA, 0..255)
 COLOR_CUR_CZ     = (255, 255, 0,   255)  # yellow
 COLOR_CUR_HCR    = (255, 255, 255, 255)  # white
@@ -206,6 +216,16 @@ class CubeView(QtWidgets.QWidget):
         self.img_cz.setLookupTable(_make_lut((255, 0, 0)))
         self.img_cz.setCompositionMode(QtGui.QPainter.CompositionMode_Plus)
         self.plot.addItem(self.img_cz)
+        # Edge-overlay ImageItems (CONTOUR_MODE == "image"): one RGBA image per view holding
+        # ALL ROI boundaries for the current slice. Added last (top zValue) so they render over
+        # the two background images; normal source-over compositing (not additive). These are
+        # full-slice, positioned in world µm via setRect, so pan/zoom transforms them for free.
+        self.edge_hcr = pg.ImageItem(axisOrder="row-major")
+        self.edge_hcr.setZValue(10)
+        self.plot.addItem(self.edge_hcr)
+        self.edge_cz = pg.ImageItem(axisOrder="row-major")
+        self.edge_cz.setZValue(11)
+        self.plot.addItem(self.edge_cz)
         self.contour_items: list[pg.PlotDataItem] = []
         # Add-match-mode overlay (warped CZ centroid markers, selection
         # highlights, landmark links) — kept separate from contour_items so it
@@ -220,6 +240,19 @@ class CubeView(QtWidgets.QWidget):
         for it in self.contour_items:
             self.plot.removeItem(it)
         self.contour_items.clear()
+
+    def set_edge_image(self, item, rgba, *, x_lo, y_lo, xy_um):
+        """Set an RGBA (H,W,4 uint8) edge overlay, positioned in world µm. rgba=None clears."""
+        if rgba is None:
+            item.clear()
+            return
+        h, w = rgba.shape[:2]
+        item.setImage(rgba, autoLevels=False)
+        item.setRect(QtCore.QRectF(x_lo, y_lo, w * xy_um, h * xy_um))
+
+    def clear_edges(self):
+        self.edge_hcr.clear()
+        self.edge_cz.clear()
 
     def clear_overlay(self):
         for it in self.overlay_items:
@@ -676,6 +709,8 @@ class QCApp(QtWidgets.QMainWindow):
         self.batch_accept_mode = False  # MIP left-click accept (function 3)
         self._id_text_item = None     # ephemeral on-image ROI-ID text (right-click)
         self.mip_mode = False  # toggled by 'm' / radio
+        # CONTOUR_MODE=="image": per-(view, slice, toggle-state, current-id) RGBA edge cache.
+        self._edge_cache: dict = {}
 
         # ---- Add-match mode (function 2) ----
         self.add_match_mode = False
@@ -1285,12 +1320,14 @@ class QCApp(QtWidgets.QMainWindow):
         # Wheel steps the Z slice; Shift+wheel zooms (handled in eventFilter).
         self.view.plot.viewport().installEventFilter(self)
 
-        # Debounced re-draw of contours on pan/zoom (so contours always cover
-        # the visible viewport, not just the cube).
+        # Pan/zoom re-draw.  In "vector" mode contours only cover the viewport (clipped to
+        # the visible XY range) so they must be re-extracted on pan/zoom — debounced 120ms.
+        # In "image" mode the edge overlay is the FULL slice as one ImageItem, which
+        # pyqtgraph transforms with the view for free, so pan/zoom needs NO rebuild.
         self._range_timer = QtCore.QTimer(self)
         self._range_timer.setSingleShot(True)
         self._range_timer.setInterval(120)
-        self._range_timer.timeout.connect(self._redraw_contours_only)
+        self._range_timer.timeout.connect(self._on_view_range_changed)
         vb = self.view.plot.getViewBox()
         vb.sigRangeChanged.connect(lambda *a, **k: self._range_timer.start())
 
@@ -1313,7 +1350,14 @@ class QCApp(QtWidgets.QMainWindow):
         self.resize(max(self.minimumWidth(), new_w), max(self.minimumHeight(), new_h))
 
     def _redraw_contours_only(self):
-        """Refresh contours for the current viewport without touching images."""
+        """Refresh ROI boundaries + match overlay without touching the background images.
+        Called by toggles (cur/other/fail) and manual-match edits — i.e. STATE changes that
+        alter which boundaries/colors are shown (as opposed to pan/zoom)."""
+        if CONTOUR_MODE == "image":
+            self.view.clear_contours()   # drop any stale vector contours
+            self._draw_edges()
+            self._draw_match_overlay()
+            return
         self.view.clear_contours()
         if self.mip_mode:
             self._draw_cz_contours_mip()
@@ -1322,6 +1366,18 @@ class QCApp(QtWidgets.QMainWindow):
             self._draw_cz_contours_at_z(self.cur_z_world)
             self._draw_hcr_contours_at_z(self.cur_z_world)
         self._draw_match_overlay()
+
+    def _on_view_range_changed(self):
+        """Fired (debounced) on pan/zoom.  In "image" mode the full-slice edge overlay is
+        transformed by pyqtgraph automatically, so the expensive per-ROI boundary extraction
+        is NOT rebuilt — this is the core fix for zoom/pan clunkiness.  The QC/add-match
+        marker overlay, however, IS viewport-clipped (see _draw_qc_markers / _draw_match_overlay),
+        so refresh only that — it is sparse scatter points, cheap to redraw.  In "vector" mode
+        contours are viewport-clipped too, so the whole thing is re-extracted."""
+        if CONTOUR_MODE == "image":
+            self._draw_match_overlay()
+            return
+        self._redraw_contours_only()
 
     def _mk_shortcut(self, key, fn):
         sc = QtWidgets.QShortcut(QtGui.QKeySequence(key), self)
@@ -1630,14 +1686,19 @@ class QCApp(QtWidgets.QMainWindow):
                     self.view.img_cz.clear()
         else:
             self.view.img_cz.clear()
-        # ----- Contours -----
-        self.view.clear_contours()
-        if self.mip_mode:
-            self._draw_cz_contours_mip()
-            self._draw_hcr_contours_mip()
+        # ----- ROI boundaries -----
+        if CONTOUR_MODE == "image":
+            self.view.clear_contours()   # image mode: one cached RGBA edge overlay per view
+            self._draw_edges()
         else:
-            self._draw_cz_contours_at_z(z_world)
-            self._draw_hcr_contours_at_z(z_world)
+            self.view.clear_edges()
+            self.view.clear_contours()
+            if self.mip_mode:
+                self._draw_cz_contours_mip()
+                self._draw_hcr_contours_mip()
+            else:
+                self._draw_cz_contours_at_z(z_world)
+                self._draw_hcr_contours_at_z(z_world)
         self._draw_match_overlay()
         # Viewport on ROI change: first ROI -> cube ± 10%; later ROIs -> keep the
         # current zoom (span) and just recenter on the new ROI.
@@ -1832,6 +1893,127 @@ class QCApp(QtWidgets.QMainWindow):
                     y = self.hbb["y_lo"] + (y0 + pts[:, 1]) * self.hcr_vox_xy
                     x = np.append(x, x[0]); y = np.append(y, y[0])
                     self.view.add_contour(x, y, color=color, width=width)
+
+    # ---------------- edge-overlay rendering (CONTOUR_MODE == "image") ----------------
+    @staticmethod
+    def _boundary_mask(lbl):
+        """True at every labeled pixel adjacent to a different label/background — all ROI
+        boundaries in one vectorized pass (replaces per-ROI cv2.findContours)."""
+        b = np.zeros(lbl.shape, dtype=bool)
+        d = lbl[:-1, :] != lbl[1:, :]
+        b[:-1, :] |= d; b[1:, :] |= d
+        d = lbl[:, :-1] != lbl[:, 1:]
+        b[:, :-1] |= d; b[:, 1:] |= d
+        return b & (lbl != 0)
+
+    def _paint_edge(self, rgba, mask, color):
+        """Paint RGBA 4-tuple ``color`` where ``mask`` is True, dilating by EDGE_PX for width."""
+        if not mask.any():
+            return
+        if EDGE_PX > 0:
+            k = 2 * EDGE_PX + 1
+            mask = cv2.dilate(mask.astype(np.uint8), np.ones((k, k), np.uint8)) > 0
+        rgba[mask] = color
+
+    def _edges_slab2d(self, arr, *, z_lo, vz):
+        """2D label image for ``arr`` at the current slice; in MIP mode a max-projection over
+        the current ROI's z-extent.  None if the slice is out of the array's z-range.
+
+        MIP note: the vector path projects each label independently (per-label ``.any(axis=0)``)
+        so overlapping projections can both draw; here a single ``max(axis=0)`` label image is
+        used (one label per pixel).  For a boundary overlay this is a faithful approximation —
+        the union of footprints — and lets the whole slab be reduced in one vectorized op."""
+        if self.mip_mode:
+            mlo, mhi = self.mip_z_world
+            z0 = max(0, int((mlo - z_lo) / vz))
+            z1 = min(arr.shape[0], int((mhi - z_lo) / vz) + 1)
+            if z0 >= z1:
+                return None
+            return arr[z0:z1].max(axis=0)
+        zv = int(round((self.cur_z_world - z_lo) / vz))
+        if not (0 <= zv < arr.shape[0]):
+            return None
+        return arr[zv]
+
+    def _edges_rgba_for_view(self, which):
+        """Full-slice RGBA (H,W,4 uint8) ROI-boundary overlay for the CZ or HCR segmentation,
+        colored by category with the current ROI on top.  Mirrors the color/toggle/current-ROI
+        semantics of the vector contour methods (COLOR_* constants, show_* gating), but as one
+        vectorized boundary pass per source array instead of cv2.findContours per ROI.  Uses
+        the seg-array bbox + voxel size (cz_bb/cz_vox, hbb/hcr_vox_*) exactly as the vector
+        contours do, so it aligns on the same world-µm grid.  Returns (rgba, x_lo, y_lo, xy_um).
+
+        The current ROI is painted LAST so its highlight is always visible over neighbors."""
+        if which == "cz":
+            bb, vxy, vz = self.cz_bb, self.cz_vox, self.cz_vox
+            sources = [(self.cz_matched_arr, COLOR_OTHER_CZM, True),
+                       (self.cz_unmatched_arr, COLOR_OTHER_CZU, True)]
+            show_other = self.show_other_cz
+            cur_id = self.cur_cz_id if self.show_cur_cz else None
+            cur_color = COLOR_CUR_CZ
+        else:
+            bb, vxy, vz = self.hbb, self.hcr_vox_xy, self.hcr_vox_z
+            sources = [(self.hcr_matched_arr, COLOR_OTHER_HCRM, True),
+                       (self.hcr_unmatched_arr, COLOR_OTHER_HCRU, True)]
+            # Failed arrays (eligible=False): drawn only when their toggle is on, never
+            # "other"-gated, and never eligible for the current-ROI highlight.
+            if self.show_hcr_fail_gfp and self.hcr_failed_gfp_arr is not None:
+                sources.append((self.hcr_failed_gfp_arr, COLOR_HCR_FAIL_GFP, False))
+            if self.show_hcr_fail_cls and self.hcr_failed_cls_arr is not None:
+                sources.append((self.hcr_failed_cls_arr, COLOR_HCR_FAIL_CLS, False))
+            show_other = self.show_other_hcr
+            cur_id = self.cur_hcr_id if (self.show_cur_hcr and self.cur_matched) else None
+            cur_color = COLOR_CUR_HCR
+        arr0 = sources[0][0]
+        H, W = int(arr0.shape[1]), int(arr0.shape[2])
+        rgba = np.zeros((H, W, 4), dtype=np.uint8)
+        cur_bnd = np.zeros((H, W), dtype=bool)   # current-ROI boundary, accumulated then on top
+        for arr, color, eligible in sources:
+            L = self._edges_slab2d(arr, z_lo=bb["z_lo"], vz=vz)
+            if L is None or L.shape != (H, W):
+                continue
+            b = self._boundary_mask(L)
+            if eligible and cur_id is not None:
+                here_cur = (L == cur_id)
+                cur_bnd |= (b & here_cur)
+                b_other = b & (~here_cur)
+            else:
+                b_other = b
+            # matched/unmatched "other" edges honor show_other; failed arrays always draw.
+            if (not eligible) or show_other:
+                self._paint_edge(rgba, b_other, color)
+        if cur_id is not None:
+            self._paint_edge(rgba, cur_bnd, cur_color)
+        return rgba, bb["x_lo"], bb["y_lo"], vxy
+
+    def _edge_state_key(self, which):
+        """Cache key = view + slice (or MIP z-range) + the toggles/current-id that change the
+        overlay.  Deliberately viewport-INDEPENDENT: pan/zoom never invalidates the cache (the
+        ImageItem is transformed instead of rebuilt)."""
+        if self.mip_mode:
+            zk = ("mip", round(self.mip_z_world[0], 3), round(self.mip_z_world[1], 3))
+        else:
+            zk = ("z", round(self.cur_z_world, 3))
+        if which == "cz":
+            return ("cz", zk, self.show_cur_cz, self.show_other_cz,
+                    (self.cur_cz_id if self.show_cur_cz else None), EDGE_PX)
+        return ("hcr", zk, self.show_cur_hcr, self.show_other_hcr,
+                self.show_hcr_fail_gfp, self.show_hcr_fail_cls, self.cur_matched,
+                (self.cur_hcr_id if (self.show_cur_hcr and self.cur_matched) else None), EDGE_PX)
+
+    def _draw_edges(self):
+        """Set the CZ + HCR edge-overlay ImageItems for the current slice/state, via a
+        per-(slice, state) RGBA cache.  Called on slice/ROI/toggle change — NOT on pan/zoom."""
+        for which, item in (("hcr", self.view.edge_hcr), ("cz", self.view.edge_cz)):
+            key = self._edge_state_key(which)
+            cached = self._edge_cache.get(key)
+            if cached is None:
+                cached = self._edges_rgba_for_view(which)
+                if len(self._edge_cache) > 256:   # bound memory over a long session
+                    self._edge_cache.clear()
+                self._edge_cache[key] = cached
+            rgba, x_lo, y_lo, xy_um = cached
+            self.view.set_edge_image(item, rgba, x_lo=x_lo, y_lo=y_lo, xy_um=xy_um)
 
     # ---------------- nav + toggles + label ----------------
     def _step_to_unqcd(self, direction: int):
