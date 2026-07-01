@@ -496,7 +496,13 @@ class QCApp(QtWidgets.QMainWindow):
     def _load_hcr488(self, qc_dir):
         """Load the HCR 488 background cropped to the warped-CZ bbox (self.cz_bb).
         Reads ONLY the crop region from the zarr (not the full pyramid level), then
-        caches it under qc_dir as .npy so later launches memmap it instantly."""
+        caches it under qc_dir as .npy so later launches reload it quickly.
+
+        The cached crop is loaded FULLY INTO RAM (not memmapped). The QC cache dir is
+        normally on a network filesystem (/scratch, NFS), where a memmap faults each
+        touched slice in over the network on demand -> laggy z-navigation/pan. One bulk
+        read into RAM up front makes every later slice access local (instant); the crop
+        is small (see the 'MB' in the caching log), so lightly-used RAM has ample room."""
         import time as _time
         bb = self.cz_bb
         level = self.hcr_level
@@ -504,16 +510,17 @@ class QCApp(QtWidgets.QMainWindow):
         cache_meta = self.cache_dir / f"hcr488_{self.variant}_L{level}.json"
         key = {"bbox": [bb["z_lo"], bb["z_hi"], bb["y_lo"], bb["y_hi"],
                         bb["x_lo"], bb["x_hi"]], "level": int(level)}
-        # Fast path: cached crop matching this bbox+level -> memmap (no decode).
+        # Fast path: cached crop matching this bbox+level -> load fully into RAM.
         if cache_npy.exists() and cache_meta.exists():
             try:
                 m = json.loads(cache_meta.read_text())
                 if m.get("key") == key:
-                    self.hcr488 = np.load(cache_npy, mmap_mode="r")
+                    self.hcr488 = np.load(cache_npy)   # in RAM, NOT mmap (see docstring)
                     self.hcr488_origin = tuple(m["origin"])
                     self.hcr488_voxel = tuple(m["voxel"])
                     self.hcr488_levels = tuple(m["levels"])
-                    print(f"[qt] HCR 488 from cache {cache_npy.name} {self.hcr488.shape}")
+                    print(f"[qt] HCR 488 from cache {cache_npy.name} {self.hcr488.shape} "
+                          f"(loaded into RAM)")
                     return
             except Exception as exc:
                 print(f"[qt] HCR488 cache unreadable ({exc}); re-reading")
