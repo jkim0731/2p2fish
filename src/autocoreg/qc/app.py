@@ -40,7 +40,9 @@ Keys:
   i          toggle batch-accept (MIP: left-click a CZ/HCR overlap to accept/remove)
   Enter      next ROI if labeled (QC mode) / add pending pair (add-match mode)
   Shift+right-click   report CZ + HCR ROI IDs overlapping the point
-  right-click         context menu (incl. "Show IDs" for the same)
+  right-click         context menu: "Show IDs" + "QC CZ <id>" submenu for the CZ ROI under
+                      the cursor (Go to it, or label it in place: good/bad/unsure, or the
+                      unmatched options) — QC any specific ROI you point at, out of queue order
   Backspace  undo last added pair (add-match mode)
   Esc        reset the pending selection (add-match mode)
 
@@ -74,6 +76,14 @@ OUT_ROOT = _config.QC_ARTIFACT_DIR
 LABELS_ROOT = _config.QC_LABELS_DIR
 CUBE_HALF_UM = 60.0
 HCR_LEVEL = 2  # default pyramid level; --level overrides
+
+# Auto-contrast clip percentiles (lower, upper) for the 488 / warped-CZ backgrounds. The display
+# maps [pct_lo, pct_hi] -> [black, full-colour], so RAISING the upper percentile pushes the white
+# point up => a DIMMER image. Default upper raised 99.5 -> 99.9 (the old 99.5 read too bright).
+# Env-overridable so operators can tune without an env rebuild (set in qc.sh):
+#   MFISH_QC_CLIP_LO (higher = darker floor)  /  MFISH_QC_CLIP_HI (higher = dimmer).
+AUTO_CLIP_LO = float(os.environ.get("MFISH_QC_CLIP_LO", "5"))
+AUTO_CLIP_HI = float(os.environ.get("MFISH_QC_CLIP_HI", "99.9"))
 
 # Colors (RGBA, 0..255)
 COLOR_CUR_CZ     = (255, 255, 0,   255)  # yellow
@@ -369,8 +379,8 @@ class QCApp(QtWidgets.QMainWindow):
                 float(cz_meta["bbox_um"]["x_lo"]),
             )
             self.czw_levels = (
-                float(np.percentile(self.czw, 5)),
-                float(np.percentile(self.czw, 99.5)),
+                float(np.percentile(self.czw, AUTO_CLIP_LO)),
+                float(np.percentile(self.czw, AUTO_CLIP_HI)),
             )
         else:
             self.czw = None
@@ -552,8 +562,8 @@ class QCApp(QtWidgets.QMainWindow):
         self.hcr488 = crop
         self.hcr488_origin = (z0 * z_um, y0 * xy_um, x0 * xy_um)
         self.hcr488_voxel = (float(z_um), float(xy_um), float(xy_um))
-        self.hcr488_levels = (float(np.percentile(crop, 5)),
-                              float(np.percentile(crop, 99.5)))
+        self.hcr488_levels = (float(np.percentile(crop, AUTO_CLIP_LO)),
+                              float(np.percentile(crop, AUTO_CLIP_HI)))
         print(f"[qt] HCR 488 crop {crop.shape} ({crop.nbytes/1e6:.0f} MB) "
               f"@ {xy_um:.3f}µm xy; caching ...", flush=True)
         try:
@@ -1265,7 +1275,13 @@ class QCApp(QtWidgets.QMainWindow):
         self.view.plot.scene().sigMouseClicked.connect(self._on_canvas_click)
         # Keep pyqtgraph's right-click menu; add a "Show IDs" action to it.
         self._last_rc_world = None
-        self.view.plot.getViewBox().menu.addAction("Show IDs", self._show_ids_from_menu)
+        _vbmenu = self.view.plot.getViewBox().menu
+        _vbmenu.addAction("Show IDs", self._show_ids_from_menu)
+        # Right-click a CZ ROI -> "QC CZ <id>" submenu: jump to it and/or label it in place.
+        # Rebuilt on each open (aboutToShow) from the CZ ROI under the right-click position.
+        self._qc_roi_menu = QtWidgets.QMenu("QC CZ ROI", self)
+        _vbmenu.addMenu(self._qc_roi_menu)
+        _vbmenu.aboutToShow.connect(self._populate_qc_roi_menu)
         # Wheel steps the Z slice; Shift+wheel zooms (handled in eventFilter).
         self.view.plot.viewport().installEventFilter(self)
 
@@ -1502,8 +1518,8 @@ class QCApp(QtWidgets.QMainWindow):
         if z0v < z1v and y0v < y1v and x0v < x1v:
             sub = self.hcr488[z0v:z1v, y0v:y1v, x0v:x1v]
             self.hcr488_levels = (
-                float(np.percentile(sub, 5)),
-                float(np.percentile(sub, 99.5)),
+                float(np.percentile(sub, AUTO_CLIP_LO)),
+                float(np.percentile(sub, AUTO_CLIP_HI)),
             )
         # Warped CZ
         if self.czw is not None:
@@ -1518,8 +1534,8 @@ class QCApp(QtWidgets.QMainWindow):
             if z0v < z1v and y0v < y1v and x0v < x1v:
                 sub = self.czw[z0v:z1v, y0v:y1v, x0v:x1v]
                 self.czw_levels = (
-                    float(np.percentile(sub, 5)),
-                    float(np.percentile(sub, 99.5)),
+                    float(np.percentile(sub, AUTO_CLIP_LO)),
+                    float(np.percentile(sub, AUTO_CLIP_HI)),
                 )
 
     # ---------------- Z step / image ----------------
@@ -2117,6 +2133,61 @@ class QCApp(QtWidgets.QMainWindow):
         if getattr(self, "_id_text_item", None) is not None:
             self.view.plot.removeItem(self._id_text_item)
             self._id_text_item = None
+
+    def _cz_id_at(self, x, y):
+        """CZ ROI id under world (x, y) in the current view (matched first, then unmatched),
+        or None. Same resolution the 'Show IDs' report uses."""
+        for arr in (self.cz_matched_arr, self.cz_unmatched_arr):
+            v = self._label_at_view(arr, self.cz_bb, self.cz_vox, self.cz_vox, x, y)
+            if v:
+                return int(v)
+        return None
+
+    def _populate_qc_roi_menu(self):
+        """(Re)build the right-click 'QC CZ <id>' submenu for the CZ ROI under the last
+        right-click position: a 'Go to' entry + the label options valid for that ROI
+        (matched -> good/bad/unsure; unmatched -> matched roi visible / not visible)."""
+        m = self._qc_roi_menu
+        m.clear()
+        wp = getattr(self, "_last_rc_world", None)
+        cz = self._cz_id_at(*wp) if wp is not None else None
+        if cz is None:
+            m.setTitle("QC CZ ROI — right-click on a CZ ROI")
+            m.setEnabled(False)
+            return
+        m.setEnabled(True)
+        matched = cz in self.cz_to_hcr
+        m.setTitle(f"QC CZ {cz}" + (f"  (→ hcr {self.cz_to_hcr[cz]})" if matched
+                                    else "  (unmatched)"))
+        in_queue = cz in self.cz_order
+        go = m.addAction(f"Go to CZ {cz}" + ("" if in_queue else "  — not in queue"))
+        go.setEnabled(in_queue)
+        go.triggered.connect(lambda _checked=False, c=cz: self._goto_cz(c))
+        m.addSeparator()
+        options = (["good", "bad", "unsure"] if matched
+                   else ["matched roi visible", "matched roi not visible"])
+        for opt in options:
+            a = m.addAction(f"label: {opt}")
+            a.setEnabled(in_queue)
+            a.triggered.connect(lambda _checked=False, c=cz, o=opt: self._qc_roi(c, o))
+
+    def _goto_cz(self, cz_id):
+        """Jump the QC queue/view to cz_id (make it current) without labeling."""
+        if cz_id in self.cz_order:
+            self.show_idx = self.cz_order.index(cz_id)
+            self._refresh_pair()
+        else:
+            self._notify(f"cz {cz_id} is not in the current QC queue", kind="warn")
+
+    def _qc_roi(self, cz_id, label):
+        """Right-click QC: jump to cz_id (make it current), then apply the QC label to it,
+        reusing the normal per-ROI save path so the label is valid for its matched-state."""
+        if cz_id not in self.cz_order:
+            self._notify(f"cz {cz_id} is not in the current QC queue", kind="warn")
+            return
+        self.show_idx = self.cz_order.index(cz_id)
+        self._refresh_pair()      # sets cur_cz_id / cur_matched / cur_hcr_id / cur_soma
+        self._save_label(label)
 
     def _show_roi_ids_at(self, x, y):
         """Right-click: report CZ + HCR ROI IDs overlapping (x, y) as ephemeral text
