@@ -448,10 +448,7 @@ class QCApp(QtWidgets.QMainWindow):
                 float(cz_meta["bbox_um"]["y_lo"]),
                 float(cz_meta["bbox_um"]["x_lo"]),
             )
-            self.czw_levels = (
-                float(np.percentile(self.czw, AUTO_CLIP_LO)),
-                float(np.percentile(self.czw, AUTO_CLIP_HI)),
-            )
+            self.czw_levels = self._levels_from_voxels(self.czw) or (0.0, 1.0)
         else:
             self.czw = None
 
@@ -632,8 +629,7 @@ class QCApp(QtWidgets.QMainWindow):
         self.hcr488 = crop
         self.hcr488_origin = (z0 * z_um, y0 * xy_um, x0 * xy_um)
         self.hcr488_voxel = (float(z_um), float(xy_um), float(xy_um))
-        self.hcr488_levels = (float(np.percentile(crop, AUTO_CLIP_LO)),
-                              float(np.percentile(crop, AUTO_CLIP_HI)))
+        self.hcr488_levels = self._levels_from_voxels(crop) or (0.0, 1.0)
         print(f"[qt] HCR 488 crop {crop.shape} ({crop.nbytes/1e6:.0f} MB) "
               f"@ {xy_um:.3f}µm xy; caching ...", flush=True)
         try:
@@ -1123,8 +1119,7 @@ class QCApp(QtWidgets.QMainWindow):
             self.czw = warped_img
             self.czw_voxel = vox
             self.czw_origin = (z_lo, y_lo, x_lo)
-            self.czw_levels = (float(np.percentile(warped_img, AUTO_CLIP_LO)),
-                               float(np.percentile(warped_img, AUTO_CLIP_HI)))
+            self.czw_levels = self._levels_from_voxels(warped_img) or (0.0, 1.0)
             self._edge_cache.clear()   # CZ seg changed → drop cached edge overlays
             self._redraw()
             self._notify(f"✓ CZ view re-warped through {len(pairs)} landmarks in {dt:.1f}s "
@@ -1193,8 +1188,7 @@ class QCApp(QtWidgets.QMainWindow):
         if self.add_match_mode and self.chk_batch.isChecked():
             self.chk_batch.setChecked(False)  # mutually exclusive click modes
         self.match_box.setVisible(self.add_match_mode)
-        # Disable the pass/fail radio while matching (avoid stray labels).
-        self.radio_box.setEnabled(not self.add_match_mode)
+        self._update_radio_enabled()
         if not self.add_match_mode:
             self.pending_cz_id = None
             self.pending_hcr_id = None
@@ -1360,6 +1354,11 @@ class QCApp(QtWidgets.QMainWindow):
                 gradient_rgb=(255, 0, 0),
                 auto_fn=lambda: self._auto_contrast("cz"),
             )
+        # The histograms drive the MAIN image's levels (setImageItem); the side views only
+        # picked them up on a full redraw, so live contrast drags didn't reach XZ/YZ.  Mirror
+        # the main image's levels onto the side views whenever a histogram changes.
+        self.hist_hcr.sigLevelsChanged.connect(lambda *_: self._sync_side_levels())
+        self.hist_cz.sigLevelsChanged.connect(lambda *_: self._sync_side_levels())
 
         # View mode: slice / MIP.  (Image/ROI toggle checkboxes are in the top toolbar.)
         mode_box = QtWidgets.QGroupBox("View mode")
@@ -1745,6 +1744,7 @@ class QCApp(QtWidgets.QMainWindow):
 
         # Build label radio
         self._build_radio(matched)
+        self._update_radio_enabled()   # unmatched labels (4/5) stay usable in add-match mode
 
         # Status label
         if matched:
@@ -1764,6 +1764,13 @@ class QCApp(QtWidgets.QMainWindow):
         status += (f"\nlabel: {cur_label}   |   "
                    f"{len(self.labels_state)} QC'd, {n_left} left")
         self.lbl_status.setText(status)
+
+    def _update_radio_enabled(self):
+        """In add-match (manual) mode, keep the UNMATCHED-ROI labels (4/5 "matched roi
+        visible/not visible") usable — the operator sets them while manually adding the pair
+        (esp. 4). Matched-pair labels (1/2/3) stay disabled during matching to avoid stray
+        labels. Outside add-match mode the whole box is enabled."""
+        self.radio_box.setEnabled((not self.add_match_mode) or (not self.cur_matched))
 
     def _build_radio(self, matched: bool):
         # Clear existing
@@ -1805,10 +1812,24 @@ class QCApp(QtWidgets.QMainWindow):
         # Fallback: cube range
         return (self.cube_bb["z_lo"], self.cube_bb["z_hi"])
 
+    @staticmethod
+    def _levels_from_voxels(sub):
+        """AUTO_CLIP percentile levels over the ACTUAL image voxels (nonzero).  Out-of-FOV
+        blanks are exactly 0 (zarr crop edges / TPS cval=0); including them near a bbox edge
+        skews the high percentile down → the image renders too bright.  Percentiles over the
+        nonzero voxels fix that.  Falls back to all voxels if too few nonzero; None if empty."""
+        vals = np.asarray(sub)
+        vals = vals[vals > 0]
+        if vals.size == 0:
+            return None                      # all blank -> keep prior levels
+        lo = float(np.percentile(vals, AUTO_CLIP_LO))
+        hi = float(np.percentile(vals, AUTO_CLIP_HI))
+        return (lo, hi) if hi > lo else None  # degenerate (near-empty cube) -> keep prior
+
     def _compute_local_levels(self, bb):
-        """Set self.hcr488_levels and self.czw_levels from the current cube's
-        sub-volume so contrast is appropriate for the local region.
-        Falls back to global levels if the cube is outside the volume."""
+        """Set self.hcr488_levels and self.czw_levels from the current cube's sub-volume
+        (over actual/nonzero image voxels) so contrast is appropriate for the local region.
+        Keeps prior levels if the cube is outside the volume / all blank."""
         # HCR 488
         z_um, xy_um, _ = self.hcr488_voxel
         oz, oy, ox = self.hcr488_origin
@@ -1819,11 +1840,9 @@ class QCApp(QtWidgets.QMainWindow):
         x0v = max(0, int((bb["x_lo"] - ox) / xy_um))
         x1v = min(self.hcr488.shape[2], int((bb["x_hi"] - ox) / xy_um) + 1)
         if z0v < z1v and y0v < y1v and x0v < x1v:
-            sub = self.hcr488[z0v:z1v, y0v:y1v, x0v:x1v]
-            self.hcr488_levels = (
-                float(np.percentile(sub, AUTO_CLIP_LO)),
-                float(np.percentile(sub, AUTO_CLIP_HI)),
-            )
+            lv = self._levels_from_voxels(self.hcr488[z0v:z1v, y0v:y1v, x0v:x1v])
+            if lv is not None:
+                self.hcr488_levels = lv
         # Warped CZ
         if self.czw is not None:
             cvox = self.czw_voxel
@@ -1835,11 +1854,9 @@ class QCApp(QtWidgets.QMainWindow):
             x0v = max(0, int((bb["x_lo"] - ox) / cvox))
             x1v = min(self.czw.shape[2], int((bb["x_hi"] - ox) / cvox) + 1)
             if z0v < z1v and y0v < y1v and x0v < x1v:
-                sub = self.czw[z0v:z1v, y0v:y1v, x0v:x1v]
-                self.czw_levels = (
-                    float(np.percentile(sub, AUTO_CLIP_LO)),
-                    float(np.percentile(sub, AUTO_CLIP_HI)),
-                )
+                lv = self._levels_from_voxels(self.czw[z0v:z1v, y0v:y1v, x0v:x1v])
+                if lv is not None:
+                    self.czw_levels = lv
 
     # ---------------- Z step / image ----------------
     def _on_z_slider(self, step_idx: int):
@@ -2373,6 +2390,17 @@ class QCApp(QtWidgets.QMainWindow):
         self.view.set_crosshair(cx, cy)      # XY: cols=x, rows=y
         self.view_xz.set_crosshair(cx, cz)   # XZ: cols=x, rows=z
         self.view_yz.set_crosshair(cz, cy)   # YZ: cols=z, rows=y
+
+    def _sync_side_levels(self):
+        """Push the main view's current image levels onto the side views (called when a contrast
+        histogram changes, so live contrast drags reach XZ/YZ without a full redraw)."""
+        if not self.show_side_views:
+            return
+        lv_hcr = self._cur_levels(self.view.img_hcr, self.hcr488_levels)
+        lv_cz = self._cur_levels(self.view.img_cz, getattr(self, "czw_levels", (0.0, 1.0)))
+        for w in (self.view_xz, self.view_yz):
+            w.img_hcr.setLevels(lv_hcr)
+            w.img_cz.setLevels(lv_cz)
 
     def _redraw_side_views(self):
         """Refresh the XZ + YZ side panels (background images + edge overlays) and crosshairs.
