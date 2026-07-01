@@ -105,6 +105,15 @@ EDGE_PX = int(os.environ.get("MFISH_QC_EDGE_PX", "0"))
 # remote-display repaint.  Off by default (zero overhead when off).
 PROFILE = os.environ.get("MFISH_QC_PROFILE", "0").strip().lower() not in ("0", "", "false", "no")
 
+# Orthoview axis map: for each view, (slice_axis, row_axis, col_axis) in volume [z,y,x] order.
+# A plane is np.take(arr, idx, axis=slice_axis); the remaining two axes come out in ascending
+# order == (row_axis, col_axis), so the plane is already [row, col].  Display: col→horizontal
+# (x-of-plot), row→vertical (y-of-plot).
+#   xy (axial, main): slice z; rows=y, cols=x
+#   xz (coronal):     slice y; rows=z, cols=x
+#   yz (sagittal):    slice x; rows=z, cols=y
+_VIEW_AX = {"xy": (0, 1, 2), "xz": (1, 0, 2), "yz": (2, 0, 1)}
+
 # Colors (RGBA, 0..255)
 COLOR_CUR_CZ     = (255, 255, 0,   255)  # yellow
 COLOR_CUR_HCR    = (255, 255, 255, 255)  # white
@@ -236,6 +245,13 @@ class CubeView(QtWidgets.QWidget):
         self.edge_cz = pg.ImageItem(axisOrder="row-major")
         self.edge_cz.setZValue(11)
         self.plot.addItem(self.edge_cz)
+        # Linked-view crosshair (orthoview): dashed lines marking the other two views' planes.
+        _chpen = pg.mkPen((255, 255, 255, 150), width=1, style=QtCore.Qt.DashLine)
+        self.vline = pg.InfiniteLine(angle=90, movable=False, pen=_chpen)
+        self.hline = pg.InfiniteLine(angle=0, movable=False, pen=_chpen)
+        self.vline.setZValue(20); self.hline.setZValue(20)
+        self.vline.setVisible(False); self.hline.setVisible(False)
+        self.plot.addItem(self.vline); self.plot.addItem(self.hline)
         self.contour_items: list[pg.PlotDataItem] = []
         # Add-match-mode overlay (warped CZ centroid markers, selection
         # highlights, landmark links) — kept separate from contour_items so it
@@ -251,18 +267,27 @@ class CubeView(QtWidgets.QWidget):
             self.plot.removeItem(it)
         self.contour_items.clear()
 
-    def set_edge_image(self, item, rgba, *, x_lo, y_lo, xy_um):
-        """Set an RGBA (H,W,4 uint8) edge overlay, positioned in world µm. rgba=None clears."""
+    def set_edge_image(self, item, rgba, *, x_lo, y_lo, xy_um, y_um=None):
+        """Set an RGBA (H,W,4 uint8) edge overlay, positioned in world µm. rgba=None clears.
+        xy_um scales cols (horizontal); y_um scales rows (vertical), defaulting to xy_um."""
         if rgba is None:
             item.clear()
             return
         h, w = rgba.shape[:2]
         item.setImage(rgba, autoLevels=False)
-        item.setRect(QtCore.QRectF(x_lo, y_lo, w * xy_um, h * xy_um))
+        item.setRect(QtCore.QRectF(x_lo, y_lo, w * xy_um, h * (y_um or xy_um)))
 
     def clear_edges(self):
         self.edge_hcr.clear()
         self.edge_cz.clear()
+
+    def set_crosshair(self, x, y):
+        """Show a linked-view crosshair: vertical line at world x (col), horizontal at y (row)."""
+        self.vline.setPos(x); self.hline.setPos(y)
+        self.vline.setVisible(True); self.hline.setVisible(True)
+
+    def hide_crosshair(self):
+        self.vline.setVisible(False); self.hline.setVisible(False)
 
     def clear_overlay(self):
         for it in self.overlay_items:
@@ -293,18 +318,20 @@ class CubeView(QtWidgets.QWidget):
         self.plot.addItem(pdi)
         self.contour_items.append(pdi)
 
-    def set_hcr_image(self, arr_2d, *, x_lo, y_lo, xy_um):
+    def set_hcr_image(self, arr_2d, *, x_lo, y_lo, xy_um, y_um=None):
+        # xy_um scales the horizontal (col) axis; y_um the vertical (row) axis. y_um defaults
+        # to xy_um (isotropic XY view); side views pass y_um = the z-voxel (anisotropic).
         h, w = arr_2d.shape
         self.img_hcr.setImage(arr_2d, autoLevels=False)
-        self.img_hcr.setRect(QtCore.QRectF(x_lo, y_lo, w * xy_um, h * xy_um))
+        self.img_hcr.setRect(QtCore.QRectF(x_lo, y_lo, w * xy_um, h * (y_um or xy_um)))
 
-    def set_cz_image(self, arr_2d, *, x_lo, y_lo, xy_um):
+    def set_cz_image(self, arr_2d, *, x_lo, y_lo, xy_um, y_um=None):
         if arr_2d is None:
             self.img_cz.clear()
             return
         h, w = arr_2d.shape
         self.img_cz.setImage(arr_2d, autoLevels=False)
-        self.img_cz.setRect(QtCore.QRectF(x_lo, y_lo, w * xy_um, h * xy_um))
+        self.img_cz.setRect(QtCore.QRectF(x_lo, y_lo, w * xy_um, h * (y_um or xy_um)))
 
 
 class QCApp(QtWidgets.QMainWindow):
@@ -706,6 +733,9 @@ class QCApp(QtWidgets.QMainWindow):
     def _init_state(self):
         self.show_idx = 0
         self.cur_z_world = 0.0
+        self.cur_y_world = 0.0   # XZ side-view plane (sliced along y) + crosshair y
+        self.cur_x_world = 0.0   # YZ side-view plane (sliced along x) + crosshair x
+        self.show_side_views = False  # linked-crosshair orthoview (toggle ` / top-left button)
         self.show_other_cz = True
         self.show_other_hcr = True
         self.show_cur_cz = True   # current pair's CZ ROI contour
@@ -1144,7 +1174,9 @@ class QCApp(QtWidgets.QMainWindow):
         lv = QtWidgets.QVBoxLayout(); lv.setContentsMargins(0, 0, 0, 0); lv.setSpacing(2)
         left.setLayout(lv)
         bar = QtWidgets.QHBoxLayout(); bar.setSpacing(10); bar.setContentsMargins(2, 0, 2, 0)
-        self.view = CubeView()
+        self.view = CubeView()          # main XY (axial)
+        self.view_xz = CubeView()       # side: rows=z, cols=x  (coronal), plane at cur_y
+        self.view_yz = CubeView()       # side: rows=z, cols=y  (sagittal), plane at cur_x
 
         def _tb(text, checked, slot, tip=""):
             cb = QtWidgets.QCheckBox(text)
@@ -1154,6 +1186,10 @@ class QCApp(QtWidgets.QMainWindow):
             cb.stateChanged.connect(lambda _=0: slot())
             bar.addWidget(cb)
             return cb
+        # Top-left: toggle the linked-crosshair orthoview (XZ + YZ side panels). Shortcut `.
+        self.chk_ortho = _tb("ortho (`)", False, self._toggle_side_views,
+                             "Linked-crosshair side views (XZ + YZ). Scroll a side view to "
+                             "move its plane. Shortcut: `")
         self.chk_hcr488 = _tb("488 (q)", True, self._toggle_hcr488, "HCR 488 image")
         self.chk_czw = _tb("CZ img (w)", True, self._toggle_czw, "CZ warped image")
         self.chk_cur_cz = _tb("pair CZ (z)", True, self._toggle_cur_cz)
@@ -1166,7 +1202,21 @@ class QCApp(QtWidgets.QMainWindow):
                                   "QC'd pair dots: good=green, bad=red, unsure=yellow")
         bar.addStretch(1)
         lv.addLayout(bar)
-        lv.addWidget(self.view, stretch=1)
+        # Image area: main XY, with the two side views in a resizable panel to its right.
+        # The side panel is hidden until the orthoview is toggled on.
+        self.side_panel = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.side_panel.setChildrenCollapsible(False)
+        self.side_panel.addWidget(self.view_xz)
+        self.side_panel.addWidget(self.view_yz)
+        self.side_panel.setVisible(False)
+        img_split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        img_split.setChildrenCollapsible(False)
+        img_split.addWidget(self.view)
+        img_split.addWidget(self.side_panel)
+        img_split.setStretchFactor(0, 3)   # main view gets the lion's share
+        img_split.setStretchFactor(1, 2)
+        self._img_split = img_split
+        lv.addWidget(img_split, stretch=1)
         h.addWidget(left)
 
         # Right control panel — scrollable so the window can shrink and add-match
@@ -1391,6 +1441,7 @@ class QCApp(QtWidgets.QMainWindow):
         self._mk_shortcut("Left", self._prev)
         self._mk_shortcut("Up", self._z_up)
         self._mk_shortcut("Down", self._z_down)
+        self._mk_shortcut("`", lambda: self.chk_ortho.toggle())  # toggle orthoview
         # Radio labels: matched 1/2/3 (good/bad/unsure); unmatched 4/5 (visible/not).
         self._mk_shortcut("1", lambda: self._radio_key(1))
         self._mk_shortcut("2", lambda: self._radio_key(2))
@@ -1429,8 +1480,13 @@ class QCApp(QtWidgets.QMainWindow):
         self._qc_roi_menu = QtWidgets.QMenu("QC CZ ROI", self)
         _vbmenu.addMenu(self._qc_roi_menu)
         _vbmenu.aboutToShow.connect(self._populate_qc_roi_menu)
-        # Wheel steps the Z slice; Shift+wheel zooms (handled in eventFilter).
-        self.view.plot.viewport().installEventFilter(self)
+        # Wheel steps the slice; Shift+wheel zooms (handled in eventFilter).  All three
+        # viewports are filtered; eventFilter dispatches the wheel by which view it is over.
+        self._vp_main = self.view.plot.viewport()
+        self._vp_xz = self.view_xz.plot.viewport()
+        self._vp_yz = self.view_yz.plot.viewport()
+        for vp in (self._vp_main, self._vp_xz, self._vp_yz):
+            vp.installEventFilter(self)
 
         # Pan/zoom re-draw.  In "vector" mode contours only cover the viewport (clipped to
         # the visible XY range) so they must be re-extracted on pan/zoom — debounced 120ms.
@@ -1469,6 +1525,7 @@ class QCApp(QtWidgets.QMainWindow):
             self.view.clear_contours()   # drop any stale vector contours
             self._draw_edges()
             self._draw_match_overlay()
+            self._redraw_side_views()    # keep the orthoview in sync with toggles (no-op if off)
             return
         self.view.clear_contours()
         if self.mip_mode:
@@ -1588,6 +1645,9 @@ class QCApp(QtWidgets.QMainWindow):
         self.cur_hcr_id = hcr_id
         self.cur_matched = matched
         self.cur_soma = soma
+        # Center the orthoview crosshair (side-view planes) on the CZ ROI centroid.
+        self.cur_y_world = float(cz_c[1])
+        self.cur_x_world = float(cz_c[2])
 
         # MIP z-range = central 80% of the current CZ ROI's z extent (in world µm)
         self.mip_z_world = self._compute_mip_z_range(cz_id)
@@ -1728,11 +1788,17 @@ class QCApp(QtWidgets.QMainWindow):
         self.z_slider.setValue(max(self.z_slider.value() - 1, 0))
 
     def eventFilter(self, obj, ev):
-        """Wheel = step Z (slice mode); Shift+wheel = zoom (falls through to pyqtgraph).
-        In MIP mode plain wheel also zooms (no Z to step).  Right-click: record the
-        position for the menu's 'Show IDs'; Shift+right-click shows IDs and is consumed."""
+        """Wheel = step the slice of the view it is over (main→z, XZ→y, YZ→x); Shift+wheel
+        zooms (falls through to pyqtgraph).  In MIP mode plain wheel also zooms (the slab is
+        pinned to the main view's range, so side views don't scroll independently).  Right-click
+        (main view only): record the position for the menu's 'Show IDs'; Shift+right-click
+        shows IDs and is consumed."""
         t = ev.type()
-        if t == QtCore.QEvent.MouseButtonPress and ev.button() == QtCore.Qt.RightButton:
+        is_main = obj is getattr(self, "_vp_main", None)
+        is_xz = obj is getattr(self, "_vp_xz", None)
+        is_yz = obj is getattr(self, "_vp_yz", None)
+        if (t == QtCore.QEvent.MouseButtonPress and ev.button() == QtCore.Qt.RightButton
+                and is_main):
             sp = self.view.plot.mapToScene(ev.pos())
             wp = self.view.plot.getViewBox().mapSceneToView(sp)
             self._last_rc_world = (float(wp.x()), float(wp.y()))
@@ -1742,13 +1808,19 @@ class QCApp(QtWidgets.QMainWindow):
             # plain right-click falls through -> pyqtgraph menu (with "Show IDs")
         elif t == QtCore.QEvent.Wheel:
             shift = bool(ev.modifiers() & QtCore.Qt.ShiftModifier)
+            # Plain wheel steps the slice of whichever view it is over — but NOT in MIP (the
+            # side views' slab is locked to the main view's range) and NOT with Shift (zoom).
             if not shift and not self.mip_mode:
                 dy = ev.angleDelta().y()
-                if dy > 0:
-                    self._z_up()
-                elif dy < 0:
-                    self._z_down()
-                return True   # consume -> plain wheel = Z, no zoom
+                if dy != 0:
+                    d = 1 if dy > 0 else -1
+                    if is_main:
+                        self._z_up() if d > 0 else self._z_down()
+                    elif is_xz:
+                        self._y_step(d)
+                    elif is_yz:
+                        self._x_step(d)
+                return True   # consume -> plain wheel = slice step, no zoom
             # Shift+wheel (or any wheel in MIP) -> fall through to pyqtgraph zoom.
         return super().eventFilter(obj, ev)
 
@@ -1831,9 +1903,23 @@ class QCApp(QtWidgets.QMainWindow):
             self.view.plot.setXRange(cx - hx, cx + hx, padding=0)
             self.view.plot.setYRange(cy - hy, cy + hy, padding=0)
             self._viewport_set_for_idx = self.show_idx
+            self._fit_side_viewports()   # fit XZ/YZ to the new cube on ROI change
+        # Side panels + linked crosshair (both no-op / hidden when the orthoview is off).
+        self._redraw_side_views()
+        self._update_crosshairs()
         if PROFILE:
             print(f"[qc-profile] full redraw (mode={CONTOUR_MODE}, mip={self.mip_mode}): "
                   f"{1e3*(time.perf_counter()-_t_redraw0):.1f} ms")
+
+    def _fit_side_viewports(self):
+        """Fit each side view to the current cube (XZ: x×z, YZ: y×z)."""
+        if not self.show_side_views:
+            return
+        bb = self.cube_bb
+        self.view_xz.plot.setXRange(bb["x_lo"], bb["x_hi"], padding=0.1)
+        self.view_xz.plot.setYRange(bb["z_lo"], bb["z_hi"], padding=0.1)
+        self.view_yz.plot.setXRange(bb["y_lo"], bb["y_hi"], padding=0.1)
+        self.view_yz.plot.setYRange(bb["z_lo"], bb["z_hi"], padding=0.1)
 
     def _viewport_xy_range(self):
         """Current visible XY range in world µm: ((y_lo, y_hi), (x_lo, x_hi))."""
@@ -2035,44 +2121,72 @@ class QCApp(QtWidgets.QMainWindow):
             mask = cv2.dilate(mask.astype(np.uint8), np.ones((k, k), np.uint8)) > 0
         rgba[mask] = color
 
-    def _edges_slab2d(self, arr, *, z_lo, vz):
-        """2D label image for ``arr`` at the current slice; in MIP mode a max-projection over
-        the current ROI's z-extent.  None if the slice is out of the array's z-range.
+    def _mip_slab_world(self, view):
+        """World-µm (lo, hi) slab along ``view``'s slice axis in MIP mode.  The main (xy) view
+        keeps its exact ROI z-extent (unchanged behavior).  Side views use the SAME slab
+        THICKNESS as the main view, centered on the crosshair — "the same range as in the main
+        view" — so all three projections cover the current ROI's slab from their own direction."""
+        sa = _VIEW_AX[view][0]
+        lo, hi = self.mip_z_world
+        if view == "xy":
+            return lo, hi
+        T = hi - lo
+        c = (self.cur_z_world, self.cur_y_world, self.cur_x_world)[sa]
+        return c - 0.5 * T, c + 0.5 * T
 
-        MIP note: the vector path projects each label independently (per-label ``.any(axis=0)``)
-        so overlapping projections can both draw; here a single ``max(axis=0)`` label image is
-        used (one label per pixel).  For a boundary overlay this is a faithful approximation —
-        the union of footprints — and lets the whole slab be reduced in one vectorized op."""
+    def _plane2d(self, arr, origin3, vox3, view):
+        """The [row, col] label/image plane of a volume for ``view``: a single slice at the
+        crosshair position along the slice axis, or (MIP mode) a max-projection over the slab.
+        ``origin3``/``vox3`` are per-axis (z, y, x) world origins + voxel sizes.  None if the
+        slice/slab is out of range.
+
+        MIP uses one ``max(axis=slice)`` (one label per output pixel) — a faithful union-of-
+        footprints boundary, and a single vectorized reduction."""
+        sa, ra, ca = _VIEW_AX[view]
         if self.mip_mode:
-            mlo, mhi = self.mip_z_world
-            z0 = max(0, int((mlo - z_lo) / vz))
-            z1 = min(arr.shape[0], int((mhi - z_lo) / vz) + 1)
-            if z0 >= z1:
+            lo, hi = self._mip_slab_world(view)
+            i0 = max(0, int((lo - origin3[sa]) / vox3[sa]))
+            i1 = min(arr.shape[sa], int((hi - origin3[sa]) / vox3[sa]) + 1)
+            if i0 >= i1:
                 return None
-            return arr[z0:z1].max(axis=0)
-        zv = int(round((self.cur_z_world - z_lo) / vz))
-        if not (0 <= zv < arr.shape[0]):
+            sl = [slice(None), slice(None), slice(None)]
+            sl[sa] = slice(i0, i1)
+            return arr[tuple(sl)].max(axis=sa)
+        cur = (self.cur_z_world, self.cur_y_world, self.cur_x_world)[sa]
+        idx = int(round((cur - origin3[sa]) / vox3[sa]))
+        if not (0 <= idx < arr.shape[sa]):
             return None
-        return arr[zv]
+        return np.take(arr, idx, axis=sa)
 
-    def _edges_rgba_for_view(self, which):
-        """Full-slice RGBA (H,W,4 uint8) ROI-boundary overlay for the CZ or HCR segmentation,
+    def _bg_plane(self, arr, origin3, vox3, view):
+        """Background-image plane for ``view`` + its display rect.
+        Returns (plane_2d | None, col_lo, row_lo, col_um, row_um)."""
+        plane = self._plane2d(arr, origin3, vox3, view)
+        if plane is None:
+            return None, 0.0, 0.0, 1.0, 1.0
+        _, ra, ca = _VIEW_AX[view]
+        return plane, origin3[ca], origin3[ra], vox3[ca], vox3[ra]
+
+    def _edges_rgba_for_view(self, which, view="xy"):
+        """RGBA (H,W,4 uint8) ROI-boundary overlay for the CZ or HCR segmentation in ``view``,
         colored by category with the current ROI on top.  Mirrors the color/toggle/current-ROI
-        semantics of the vector contour methods (COLOR_* constants, show_* gating), but as one
-        vectorized boundary pass per source array instead of cv2.findContours per ROI.  Uses
-        the seg-array bbox + voxel size (cz_bb/cz_vox, hbb/hcr_vox_*) exactly as the vector
-        contours do, so it aligns on the same world-µm grid.  Returns (rgba, x_lo, y_lo, xy_um).
+        semantics of the vector contour methods (COLOR_* constants, show_* gating), as one
+        vectorized boundary pass per source array (no cv2.findContours per ROI).  Uses the
+        seg-array bbox + per-axis voxel size, so it aligns on the same world-µm grid as the
+        background images.  Returns (rgba, col_lo, row_lo, col_um, row_um).
 
         The current ROI is painted LAST so its highlight is always visible over neighbors."""
         if which == "cz":
-            bb, vxy, vz = self.cz_bb, self.cz_vox, self.cz_vox
+            origin3 = (self.cz_bb["z_lo"], self.cz_bb["y_lo"], self.cz_bb["x_lo"])
+            vox3 = (self.cz_vox, self.cz_vox, self.cz_vox)
             sources = [(self.cz_matched_arr, COLOR_OTHER_CZM, True),
                        (self.cz_unmatched_arr, COLOR_OTHER_CZU, True)]
             show_other = self.show_other_cz
             cur_id = self.cur_cz_id if self.show_cur_cz else None
             cur_color = COLOR_CUR_CZ
         else:
-            bb, vxy, vz = self.hbb, self.hcr_vox_xy, self.hcr_vox_z
+            origin3 = (self.hbb["z_lo"], self.hbb["y_lo"], self.hbb["x_lo"])
+            vox3 = (self.hcr_vox_z, self.hcr_vox_xy, self.hcr_vox_xy)
             sources = [(self.hcr_matched_arr, COLOR_OTHER_HCRM, True),
                        (self.hcr_unmatched_arr, COLOR_OTHER_HCRU, True)]
             # Failed arrays (eligible=False): drawn only when their toggle is on, never
@@ -2084,12 +2198,13 @@ class QCApp(QtWidgets.QMainWindow):
             show_other = self.show_other_hcr
             cur_id = self.cur_hcr_id if (self.show_cur_hcr and self.cur_matched) else None
             cur_color = COLOR_CUR_HCR
+        _, ra, ca = _VIEW_AX[view]
         arr0 = sources[0][0]
-        H, W = int(arr0.shape[1]), int(arr0.shape[2])
+        H, W = int(arr0.shape[ra]), int(arr0.shape[ca])
         rgba = np.zeros((H, W, 4), dtype=np.uint8)
         cur_bnd = np.zeros((H, W), dtype=bool)   # current-ROI boundary, accumulated then on top
         for arr, color, eligible in sources:
-            L = self._edges_slab2d(arr, z_lo=bb["z_lo"], vz=vz)
+            L = self._plane2d(arr, origin3, vox3, view)
             if L is None or L.shape != (H, W):
                 continue
             b = self._boundary_mask(L)
@@ -2104,42 +2219,135 @@ class QCApp(QtWidgets.QMainWindow):
                 self._paint_edge(rgba, b_other, color)
         if cur_id is not None:
             self._paint_edge(rgba, cur_bnd, cur_color)
-        return rgba, bb["x_lo"], bb["y_lo"], vxy
+        return rgba, origin3[ca], origin3[ra], vox3[ca], vox3[ra]
 
-    def _edge_state_key(self, which):
-        """Cache key = view + slice (or MIP z-range) + the toggles/current-id that change the
-        overlay.  Deliberately viewport-INDEPENDENT: pan/zoom never invalidates the cache (the
-        ImageItem is transformed instead of rebuilt)."""
+    def _edge_state_key(self, which, view="xy"):
+        """Cache key = view + slice (or MIP slab) along the view's slice axis + the toggles/
+        current-id that change the overlay.  Deliberately viewport-INDEPENDENT: pan/zoom never
+        invalidates the cache (the ImageItem is transformed instead of rebuilt)."""
+        sa = _VIEW_AX[view][0]
         if self.mip_mode:
-            zk = ("mip", round(self.mip_z_world[0], 3), round(self.mip_z_world[1], 3))
+            lo, hi = self._mip_slab_world(view)
+            zk = ("mip", round(lo, 3), round(hi, 3))
         else:
-            zk = ("z", round(self.cur_z_world, 3))
+            cur = (self.cur_z_world, self.cur_y_world, self.cur_x_world)[sa]
+            zk = ("sl", round(cur, 3))
         if which == "cz":
-            return ("cz", zk, self.show_cur_cz, self.show_other_cz,
+            return ("cz", view, zk, self.show_cur_cz, self.show_other_cz,
                     (self.cur_cz_id if self.show_cur_cz else None), EDGE_PX)
-        return ("hcr", zk, self.show_cur_hcr, self.show_other_hcr,
+        return ("hcr", view, zk, self.show_cur_hcr, self.show_other_hcr,
                 self.show_hcr_fail_gfp, self.show_hcr_fail_cls, self.cur_matched,
                 (self.cur_hcr_id if (self.show_cur_hcr and self.cur_matched) else None), EDGE_PX)
 
-    def _draw_edges(self):
-        """Set the CZ + HCR edge-overlay ImageItems for the current slice/state, via a
-        per-(slice, state) RGBA cache.  Called on slice/ROI/toggle change — NOT on pan/zoom."""
-        for which, item in (("hcr", self.view.edge_hcr), ("cz", self.view.edge_cz)):
-            key = self._edge_state_key(which)
+    def _draw_edges(self, view="xy", widget=None):
+        """Set the CZ + HCR edge-overlay ImageItems for ``view`` on ``widget`` (default main),
+        via a per-(view, slice, state) RGBA cache.  Called on slice/ROI/toggle change — NOT on
+        pan/zoom."""
+        widget = widget if widget is not None else self.view
+        for which, item in (("hcr", widget.edge_hcr), ("cz", widget.edge_cz)):
+            key = self._edge_state_key(which, view)
             cached = self._edge_cache.get(key)
             if cached is None:
                 t0 = time.perf_counter() if PROFILE else 0.0
-                cached = self._edges_rgba_for_view(which)
-                if len(self._edge_cache) > 256:   # bound memory over a long session
+                cached = self._edges_rgba_for_view(which, view)
+                if len(self._edge_cache) > 512:   # bound memory over a long session (3 views)
                     self._edge_cache.clear()
                 self._edge_cache[key] = cached
                 if PROFILE:
-                    print(f"[qc-profile] edge build {which}: {1e3*(time.perf_counter()-t0):.1f} ms "
-                          f"(miss; cache={len(self._edge_cache)})")
+                    print(f"[qc-profile] edge build {which}/{view}: "
+                          f"{1e3*(time.perf_counter()-t0):.1f} ms (miss; cache={len(self._edge_cache)})")
             elif PROFILE:
-                print(f"[qc-profile] edge {which}: cache hit")
-            rgba, x_lo, y_lo, xy_um = cached
-            self.view.set_edge_image(item, rgba, x_lo=x_lo, y_lo=y_lo, xy_um=xy_um)
+                print(f"[qc-profile] edge {which}/{view}: cache hit")
+            rgba, col_lo, row_lo, col_um, row_um = cached
+            widget.set_edge_image(item, rgba, x_lo=col_lo, y_lo=row_lo, xy_um=col_um, y_um=row_um)
+
+    # ---------------- linked-crosshair orthoview (side views) ----------------
+    def _toggle_side_views(self):
+        self.show_side_views = self.chk_ortho.isChecked()
+        self.side_panel.setVisible(self.show_side_views)
+        if self.show_side_views:
+            total = max(self._img_split.width(), 800)
+            main_w = int(total * 0.6)
+            self._img_split.setSizes([main_w, total - main_w])  # main ~60%, side panel ~40%
+            self._fit_side_viewports()
+            self._redraw_side_views()
+        self._update_crosshairs()
+
+    def _update_crosshairs(self):
+        """Draw the linked crosshair in every view (or hide it when the orthoview is off).
+        Each view's (vertical=col, horizontal=row) lines mark the OTHER two planes."""
+        if not self.show_side_views:
+            for w in (self.view, self.view_xz, self.view_yz):
+                w.hide_crosshair()
+            return
+        cz, cy, cx = self.cur_z_world, self.cur_y_world, self.cur_x_world
+        self.view.set_crosshair(cx, cy)      # XY: cols=x, rows=y
+        self.view_xz.set_crosshair(cx, cz)   # XZ: cols=x, rows=z
+        self.view_yz.set_crosshair(cy, cz)   # YZ: cols=y, rows=z
+
+    def _redraw_side_views(self):
+        """Refresh the XZ + YZ side panels (background images + edge overlays) and crosshairs.
+        No-op when the orthoview is off.  Cheap: same in-RAM slice + vectorized boundary pass as
+        the main view, just along y/x instead of z."""
+        if not self.show_side_views:
+            return
+        z_um, xy_um, _ = self.hcr488_voxel
+        hcr_vox3 = (z_um, xy_um, xy_um)
+        # Match the MAIN view's current contrast (incl. live histogram drags), not just auto.
+        lv_hcr = self._cur_levels(self.view.img_hcr, self.hcr488_levels)
+        lv_cz = self._cur_levels(self.view.img_cz, getattr(self, "czw_levels", (0.0, 1.0)))
+        for view, w in (("xz", self.view_xz), ("yz", self.view_yz)):
+            # HCR 488 background
+            if self.show_hcr488:
+                plane, cl, rl, cu, ru = self._bg_plane(self.hcr488, self.hcr488_origin, hcr_vox3, view)
+                if plane is not None:
+                    w.set_hcr_image(plane, x_lo=cl, y_lo=rl, xy_um=cu, y_um=ru)
+                    w.img_hcr.setLevels(lv_hcr)
+                else:
+                    w.img_hcr.clear()
+            else:
+                w.img_hcr.clear()
+            # Warped CZ background
+            if self.show_czw and self.czw is not None:
+                cvox3 = (self.czw_voxel, self.czw_voxel, self.czw_voxel)
+                plane, cl, rl, cu, ru = self._bg_plane(self.czw, self.czw_origin, cvox3, view)
+                if plane is not None:
+                    w.set_cz_image(plane, x_lo=cl, y_lo=rl, xy_um=cu, y_um=ru)
+                    w.img_cz.setLevels(lv_cz)
+                else:
+                    w.img_cz.clear()
+            else:
+                w.img_cz.clear()
+            # ROI boundaries: always the edge-overlay for side views (the vector-contour path is
+            # XY-only; the edge builder is mode-independent, so side views work in both modes).
+            w.clear_contours()
+            self._draw_edges(view, w)
+        self._update_crosshairs()
+
+    @staticmethod
+    def _cur_levels(item, fallback):
+        """The ImageItem's current display levels (min,max), else ``fallback``."""
+        lv = getattr(item, "levels", None)
+        if lv is None:
+            return fallback
+        try:
+            return (float(lv[0]), float(lv[1]))
+        except (TypeError, IndexError, ValueError):
+            return fallback
+
+    def _y_step(self, delta):
+        """Move the XZ side-view plane (world y) by one HCR-xy voxel, clamped to the cube."""
+        bb = self.cube_bb
+        ny = self.cur_y_world + delta * self.hcr488_voxel[1]
+        self.cur_y_world = float(min(max(ny, bb["y_lo"]), bb["y_hi"]))
+        self._redraw_side_views()
+
+    def _x_step(self, delta):
+        """Move the YZ side-view plane (world x) by one HCR-xy voxel, clamped to the cube."""
+        bb = self.cube_bb
+        nx = self.cur_x_world + delta * self.hcr488_voxel[1]
+        self.cur_x_world = float(min(max(nx, bb["x_lo"]), bb["x_hi"]))
+        self._redraw_side_views()
 
     # ---------------- nav + toggles + label ----------------
     def _step_to_unqcd(self, direction: int):
