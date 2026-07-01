@@ -105,14 +105,14 @@ EDGE_PX = int(os.environ.get("MFISH_QC_EDGE_PX", "0"))
 # remote-display repaint.  Off by default (zero overhead when off).
 PROFILE = os.environ.get("MFISH_QC_PROFILE", "0").strip().lower() not in ("0", "", "false", "no")
 
-# Orthoview axis map: for each view, (slice_axis, row_axis, col_axis) in volume [z,y,x] order.
-# A plane is np.take(arr, idx, axis=slice_axis); the remaining two axes come out in ascending
-# order == (row_axis, col_axis), so the plane is already [row, col].  Display: col→horizontal
-# (x-of-plot), row→vertical (y-of-plot).
-#   xy (axial, main): slice z; rows=y, cols=x
-#   xz (coronal):     slice y; rows=z, cols=x
-#   yz (sagittal):    slice x; rows=z, cols=y
-_VIEW_AX = {"xy": (0, 1, 2), "xz": (1, 0, 2), "yz": (2, 0, 1)}
+# Orthoview axis map: for each view, (slice_axis, row_axis, col_axis) in volume [z,y,x] order,
+# where row→vertical (plot y) and col→horizontal (plot x).  A plane is extracted along
+# slice_axis; the two remaining axes come out ascending, so if row_axis > col_axis the plane is
+# transposed (see _plane2d).  Layout (radiological, axes visibly shared):
+#     [ YZ ][ XY ]     XY (axial, main): slice z; rows=y, cols=x
+#     [    ][ XZ ]     XZ (coronal):     slice y; rows=z, cols=x   -> shares x with XY (below it)
+#                      YZ (sagittal):    slice x; rows=y, cols=z   -> shares y with XY (left of it)
+_VIEW_AX = {"xy": (0, 1, 2), "xz": (1, 0, 2), "yz": (2, 1, 0)}
 
 # Colors (RGBA, 0..255)
 COLOR_CUR_CZ     = (255, 255, 0,   255)  # yellow
@@ -1186,10 +1186,14 @@ class QCApp(QtWidgets.QMainWindow):
             cb.stateChanged.connect(lambda _=0: slot())
             bar.addWidget(cb)
             return cb
-        # Top-left: toggle the linked-crosshair orthoview (XZ + YZ side panels). Shortcut `.
-        self.chk_ortho = _tb("ortho (`)", False, self._toggle_side_views,
-                             "Linked-crosshair side views (XZ + YZ). Scroll a side view to "
-                             "move its plane. Shortcut: `")
+        # Top-left: checkable BUTTON toggling the linked-crosshair orthoview (XZ + YZ). Shortcut `.
+        self.btn_ortho = QtWidgets.QPushButton("ortho (`)")
+        self.btn_ortho.setCheckable(True)
+        self.btn_ortho.setChecked(False)
+        self.btn_ortho.setToolTip("Linked-crosshair side views (XZ below, YZ left; axes shared). "
+                                  "Scroll a side view to move its plane. Shortcut: `")
+        self.btn_ortho.toggled.connect(lambda _=0: self._toggle_side_views())
+        bar.addWidget(self.btn_ortho)
         self.chk_hcr488 = _tb("488 (q)", True, self._toggle_hcr488, "HCR 488 image")
         self.chk_czw = _tb("CZ img (w)", True, self._toggle_czw, "CZ warped image")
         self.chk_cur_cz = _tb("pair CZ (z)", True, self._toggle_cur_cz)
@@ -1202,21 +1206,23 @@ class QCApp(QtWidgets.QMainWindow):
                                   "QC'd pair dots: good=green, bad=red, unsure=yellow")
         bar.addStretch(1)
         lv.addLayout(bar)
-        # Image area: main XY, with the two side views in a resizable panel to its right.
-        # The side panel is hidden until the orthoview is toggled on.
-        self.side_panel = QtWidgets.QSplitter(QtCore.Qt.Vertical)
-        self.side_panel.setChildrenCollapsible(False)
-        self.side_panel.addWidget(self.view_xz)
-        self.side_panel.addWidget(self.view_yz)
-        self.side_panel.setVisible(False)
-        img_split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-        img_split.setChildrenCollapsible(False)
-        img_split.addWidget(self.view)
-        img_split.addWidget(self.side_panel)
-        img_split.setStretchFactor(0, 3)   # main view gets the lion's share
-        img_split.setStretchFactor(1, 2)
-        self._img_split = img_split
-        lv.addWidget(img_split, stretch=1)
+        # Image area (radiological orthoview grid), so the shared axes line up pixel-for-pixel:
+        #     [ YZ ][ XY ]     XY & XZ share column 1  -> x aligned
+        #     [    ][ XZ ]     YZ & XY share row 0      -> y aligned
+        # Side views start hidden + their row/col stretch 0, so XY fills the whole area until the
+        # orthoview is toggled on (_toggle_side_views flips visibility + stretch).
+        image_area = QtWidgets.QWidget()
+        grid = QtWidgets.QGridLayout(image_area)
+        grid.setContentsMargins(0, 0, 0, 0); grid.setSpacing(2)
+        grid.addWidget(self.view_yz, 0, 0)
+        grid.addWidget(self.view, 0, 1)
+        grid.addWidget(self.view_xz, 1, 1)
+        grid.setColumnStretch(0, 0); grid.setColumnStretch(1, 1)
+        grid.setRowStretch(0, 1); grid.setRowStretch(1, 0)
+        self._img_grid = grid
+        self.view_yz.setVisible(False)
+        self.view_xz.setVisible(False)
+        lv.addWidget(image_area, stretch=1)
         h.addWidget(left)
 
         # Right control panel — scrollable so the window can shrink and add-match
@@ -1441,7 +1447,7 @@ class QCApp(QtWidgets.QMainWindow):
         self._mk_shortcut("Left", self._prev)
         self._mk_shortcut("Up", self._z_up)
         self._mk_shortcut("Down", self._z_down)
-        self._mk_shortcut("`", lambda: self.chk_ortho.toggle())  # toggle orthoview
+        self._mk_shortcut("`", lambda: self.btn_ortho.toggle())  # toggle orthoview
         # Radio labels: matched 1/2/3 (good/bad/unsure); unmatched 4/5 (visible/not).
         self._mk_shortcut("1", lambda: self._radio_key(1))
         self._mk_shortcut("2", lambda: self._radio_key(2))
@@ -1487,6 +1493,14 @@ class QCApp(QtWidgets.QMainWindow):
         self._vp_yz = self.view_yz.plot.viewport()
         for vp in (self._vp_main, self._vp_xz, self._vp_yz):
             vp.installEventFilter(self)
+        # Share axes with the main view: XZ (below) locks its x to XY's x; YZ (left) locks its
+        # y to XY's y.  So pan/zoom in the shared axis stays in sync + features line up.  The
+        # non-shared axis (z) is fit independently, so aspect-lock is off on the side views.
+        _mvb = self.view.plot.getViewBox()
+        self.view_xz.plot.getViewBox().setXLink(_mvb)
+        self.view_yz.plot.getViewBox().setYLink(_mvb)
+        self.view_xz.plot.setAspectLocked(False)
+        self.view_yz.plot.setAspectLocked(False)
 
         # Pan/zoom re-draw.  In "vector" mode contours only cover the viewport (clipped to
         # the visible XY range) so they must be re-extracted on pan/zoom — debounced 120ms.
@@ -1912,14 +1926,14 @@ class QCApp(QtWidgets.QMainWindow):
                   f"{1e3*(time.perf_counter()-_t_redraw0):.1f} ms")
 
     def _fit_side_viewports(self):
-        """Fit each side view to the current cube (XZ: x×z, YZ: y×z)."""
+        """Fit the side views' z (non-shared) axis to the current cube.  The shared axes are
+        LINKED to the main view (XZ.x↔XY.x, YZ.y↔XY.y), so they follow XY automatically and are
+        not set here."""
         if not self.show_side_views:
             return
         bb = self.cube_bb
-        self.view_xz.plot.setXRange(bb["x_lo"], bb["x_hi"], padding=0.1)
-        self.view_xz.plot.setYRange(bb["z_lo"], bb["z_hi"], padding=0.1)
-        self.view_yz.plot.setXRange(bb["y_lo"], bb["y_hi"], padding=0.1)
-        self.view_yz.plot.setYRange(bb["z_lo"], bb["z_hi"], padding=0.1)
+        self.view_xz.plot.setYRange(bb["z_lo"], bb["z_hi"], padding=0.1)  # XZ vertical = z
+        self.view_yz.plot.setXRange(bb["z_lo"], bb["z_hi"], padding=0.1)  # YZ horizontal = z
 
     def _viewport_xy_range(self):
         """Current visible XY range in world µm: ((y_lo, y_hi), (x_lo, x_hi))."""
@@ -2151,12 +2165,16 @@ class QCApp(QtWidgets.QMainWindow):
                 return None
             sl = [slice(None), slice(None), slice(None)]
             sl[sa] = slice(i0, i1)
-            return arr[tuple(sl)].max(axis=sa)
-        cur = (self.cur_z_world, self.cur_y_world, self.cur_x_world)[sa]
-        idx = int(round((cur - origin3[sa]) / vox3[sa]))
-        if not (0 <= idx < arr.shape[sa]):
-            return None
-        return np.take(arr, idx, axis=sa)
+            plane = arr[tuple(sl)].max(axis=sa)
+        else:
+            cur = (self.cur_z_world, self.cur_y_world, self.cur_x_world)[sa]
+            idx = int(round((cur - origin3[sa]) / vox3[sa]))
+            if not (0 <= idx < arr.shape[sa]):
+                return None
+            plane = np.take(arr, idx, axis=sa)
+        # The extracted plane's axes are the two non-slice axes in ascending order; transpose
+        # to (row_axis, col_axis) when the desired row axis is the higher-numbered one (YZ).
+        return plane.T if ra > ca else plane
 
     def _bg_plane(self, arr, origin3, vox3, view):
         """Background-image plane for ``view`` + its display rect.
@@ -2263,14 +2281,18 @@ class QCApp(QtWidgets.QMainWindow):
 
     # ---------------- linked-crosshair orthoview (side views) ----------------
     def _toggle_side_views(self):
-        self.show_side_views = self.chk_ortho.isChecked()
-        self.side_panel.setVisible(self.show_side_views)
+        self.show_side_views = self.btn_ortho.isChecked()
+        self.view_yz.setVisible(self.show_side_views)
+        self.view_xz.setVisible(self.show_side_views)
         if self.show_side_views:
-            total = max(self._img_split.width(), 800)
-            main_w = int(total * 0.6)
-            self._img_split.setSizes([main_w, total - main_w])  # main ~60%, side panel ~40%
+            self._img_grid.setColumnStretch(0, 1); self._img_grid.setColumnStretch(1, 3)
+            self._img_grid.setRowStretch(0, 3); self._img_grid.setRowStretch(1, 1)
             self._fit_side_viewports()
             self._redraw_side_views()
+        else:
+            # Collapse the YZ column + XZ row so the main XY view fills the whole area.
+            self._img_grid.setColumnStretch(0, 0); self._img_grid.setColumnStretch(1, 1)
+            self._img_grid.setRowStretch(0, 1); self._img_grid.setRowStretch(1, 0)
         self._update_crosshairs()
 
     def _update_crosshairs(self):
@@ -2283,7 +2305,7 @@ class QCApp(QtWidgets.QMainWindow):
         cz, cy, cx = self.cur_z_world, self.cur_y_world, self.cur_x_world
         self.view.set_crosshair(cx, cy)      # XY: cols=x, rows=y
         self.view_xz.set_crosshair(cx, cz)   # XZ: cols=x, rows=z
-        self.view_yz.set_crosshair(cy, cz)   # YZ: cols=y, rows=z
+        self.view_yz.set_crosshair(cz, cy)   # YZ: cols=z, rows=y
 
     def _redraw_side_views(self):
         """Refresh the XZ + YZ side panels (background images + edge overlays) and crosshairs.
