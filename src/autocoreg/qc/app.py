@@ -746,6 +746,16 @@ class QCApp(QtWidgets.QMainWindow):
         self.show_hcr_fail_cls = False
         self.show_qc_markers = True   # spatial dots for QC'd pairs (good/bad/unsure)
         self.skip_qcd = True          # Next/Prev skip already-QC'd pairs
+        # Editable contour colors (RGBA), seeded from the module defaults.  Right-click a
+        # contour checkbox to change its color; the checkboxes are tinted with these.
+        self.col_cur_cz = COLOR_CUR_CZ
+        self.col_cur_hcr = COLOR_CUR_HCR
+        self.col_other_czm = COLOR_OTHER_CZM
+        self.col_other_czu = COLOR_OTHER_CZU
+        self.col_other_hcrm = COLOR_OTHER_HCRM
+        self.col_other_hcru = COLOR_OTHER_HCRU
+        self.col_fail_gfp = COLOR_HCR_FAIL_GFP
+        self.col_fail_cls = COLOR_HCR_FAIL_CLS
         self.batch_accept_mode = False  # MIP left-click accept (function 3)
         self._id_text_item = None     # ephemeral on-image ROI-ID text (right-click)
         self.mip_mode = False  # toggled by 'm' / radio
@@ -950,6 +960,16 @@ class QCApp(QtWidgets.QMainWindow):
                           "manual", "manual")
         self.pending_cz_id = None
         self.pending_hcr_id = None
+        # Make the just-added pair the CURRENT pair so the "pair HCR (x)" toggle highlights the
+        # newly matched HCR in white (and "pair CZ (z)" its CZ in yellow).
+        self.cur_cz_id = cz
+        self.cur_hcr_id = hc
+        self.cur_matched = True
+        self.mip_z_world = self._compute_mip_z_range(cz)
+        cc = self.cz_world.get(cz)
+        if cc is not None:                       # re-center the orthoview crosshair on it too
+            self.cur_y_world = float(cc[1])
+            self.cur_x_world = float(cc[2])
         self._set_match_status(self._counts_summary() + "  (added, TPS refit)")
         self._notify(f"✓ manual cz{cz} ↔ hcr{hc}   (QC'd: {len(self.labels_state)})",
                      kind="ok")
@@ -1240,6 +1260,7 @@ class QCApp(QtWidgets.QMainWindow):
         self.chk_hcr_fail_cls = _tb("failCLS (n)", False, self._toggle_hcr_fail_cls)
         self.chk_qc_markers = _tb("markers (m)", True, self._toggle_qc_markers,
                                   "QC'd pair dots: good=green, bad=red, unsure=yellow")
+        self._setup_color_checkboxes()   # tint contour checkboxes + right-click color editing
         bar.addStretch(1)
         lv.addLayout(bar)
         # Image area (radiological orthoview grid), so the shared axes line up pixel-for-pixel:
@@ -1982,6 +2003,8 @@ class QCApp(QtWidgets.QMainWindow):
         return (float(y_lo), float(y_hi)), (float(x_lo), float(x_hi))
 
     def _draw_cz_contours_at_z(self, z_world: float):
+        COLOR_OTHER_CZM, COLOR_OTHER_CZU, COLOR_CUR_CZ = (
+            self.col_other_czm, self.col_other_czu, self.col_cur_cz)   # editable colors
         cv = self.cz_vox
         z_vox = int(round((z_world - self.cz_bb["z_lo"]) / cv))
         (vy_lo, vy_hi), (vx_lo, vx_hi) = self._viewport_xy_range()
@@ -2020,6 +2043,9 @@ class QCApp(QtWidgets.QMainWindow):
                     self.view.add_contour(x, y, color=color, width=width)
 
     def _draw_hcr_contours_at_z(self, z_world: float):
+        COLOR_OTHER_HCRM, COLOR_OTHER_HCRU, COLOR_HCR_FAIL_GFP, COLOR_HCR_FAIL_CLS, COLOR_CUR_HCR = (
+            self.col_other_hcrm, self.col_other_hcru, self.col_fail_gfp, self.col_fail_cls,
+            self.col_cur_hcr)   # editable colors
         z_vox = int(round((z_world - self.hbb["z_lo"]) / self.hcr_vox_z))
         (vy_lo, vy_hi), (vx_lo, vx_hi) = self._viewport_xy_range()
         # Build (arr, color, is_failed) sources.  Failed arrays only included
@@ -2068,6 +2094,8 @@ class QCApp(QtWidgets.QMainWindow):
                     self.view.add_contour(x, y, color=color, width=width)
 
     def _draw_cz_contours_mip(self):
+        COLOR_OTHER_CZM, COLOR_OTHER_CZU, COLOR_CUR_CZ = (
+            self.col_other_czm, self.col_other_czu, self.col_cur_cz)   # editable colors
         cv = self.cz_vox
         (vy_lo, vy_hi), (vx_lo, vx_hi) = self._viewport_xy_range()
         # Use the current CZ ROI's 80% z-extent for MIP, not the full cube z
@@ -2106,6 +2134,9 @@ class QCApp(QtWidgets.QMainWindow):
                     self.view.add_contour(x, y, color=color, width=width)
 
     def _draw_hcr_contours_mip(self):
+        COLOR_OTHER_HCRM, COLOR_OTHER_HCRU, COLOR_HCR_FAIL_GFP, COLOR_HCR_FAIL_CLS, COLOR_CUR_HCR = (
+            self.col_other_hcrm, self.col_other_hcru, self.col_fail_gfp, self.col_fail_cls,
+            self.col_cur_hcr)   # editable colors
         (vy_lo, vy_hi), (vx_lo, vx_hi) = self._viewport_xy_range()
         mip_z_lo, mip_z_hi = self.mip_z_world
         sources = [
@@ -2233,25 +2264,25 @@ class QCApp(QtWidgets.QMainWindow):
         if which == "cz":
             origin3 = (self.cz_bb["z_lo"], self.cz_bb["y_lo"], self.cz_bb["x_lo"])
             vox3 = (self.cz_vox, self.cz_vox, self.cz_vox)
-            sources = [(self.cz_matched_arr, COLOR_OTHER_CZM, True),
-                       (self.cz_unmatched_arr, COLOR_OTHER_CZU, True)]
+            sources = [(self.cz_matched_arr, self.col_other_czm, True),
+                       (self.cz_unmatched_arr, self.col_other_czu, True)]
             show_other = self.show_other_cz
             cur_id = self.cur_cz_id if self.show_cur_cz else None
-            cur_color = COLOR_CUR_CZ
+            cur_color = self.col_cur_cz
         else:
             origin3 = (self.hbb["z_lo"], self.hbb["y_lo"], self.hbb["x_lo"])
             vox3 = (self.hcr_vox_z, self.hcr_vox_xy, self.hcr_vox_xy)
-            sources = [(self.hcr_matched_arr, COLOR_OTHER_HCRM, True),
-                       (self.hcr_unmatched_arr, COLOR_OTHER_HCRU, True)]
+            sources = [(self.hcr_matched_arr, self.col_other_hcrm, True),
+                       (self.hcr_unmatched_arr, self.col_other_hcru, True)]
             # Failed arrays (eligible=False): drawn only when their toggle is on, never
             # "other"-gated, and never eligible for the current-ROI highlight.
             if self.show_hcr_fail_gfp and self.hcr_failed_gfp_arr is not None:
-                sources.append((self.hcr_failed_gfp_arr, COLOR_HCR_FAIL_GFP, False))
+                sources.append((self.hcr_failed_gfp_arr, self.col_fail_gfp, False))
             if self.show_hcr_fail_cls and self.hcr_failed_cls_arr is not None:
-                sources.append((self.hcr_failed_cls_arr, COLOR_HCR_FAIL_CLS, False))
+                sources.append((self.hcr_failed_cls_arr, self.col_fail_cls, False))
             show_other = self.show_other_hcr
             cur_id = self.cur_hcr_id if (self.show_cur_hcr and self.cur_matched) else None
-            cur_color = COLOR_CUR_HCR
+            cur_color = self.col_cur_hcr
         _, ra, ca = _VIEW_AX[view]
         arr0 = sources[0][0]
         H, W = int(arr0.shape[ra]), int(arr0.shape[ca])
@@ -2527,6 +2558,75 @@ class QCApp(QtWidgets.QMainWindow):
     def _toggle_qc_markers(self):
         self.show_qc_markers = self.chk_qc_markers.isChecked()
         self._draw_match_overlay()
+
+    # ---------------- editable contour colors ----------------
+    # Each contour checkbox is tinted with its contour color; right-click it to change the color.
+    # Combined toggles (other CZ/HCR) cover a matched + an unmatched color — right-click offers
+    # both.  Keyed by the checkbox; each entry is a list of (menu label, color-attr name).
+    _COLOR_GROUPS = {
+        "cur_cz":   [("Current CZ", "col_cur_cz")],
+        "cur_hcr":  [("Current HCR", "col_cur_hcr")],
+        "other_cz": [("Other matched CZ", "col_other_czm"),
+                     ("Other unmatched CZ", "col_other_czu")],
+        "other_hcr": [("Other matched HCR", "col_other_hcrm"),
+                      ("Other unmatched HCR", "col_other_hcru")],
+        "fail_gfp": [("Failed GFP+", "col_fail_gfp")],
+        "fail_cls": [("Failed classifier", "col_fail_cls")],
+    }
+
+    @staticmethod
+    def _text_color_for(rgba):
+        """Black or white text, whichever contrasts better with the given RGBA background."""
+        r, g, b = rgba[0], rgba[1], rgba[2]
+        lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0   # perceived luminance
+        return "#000000" if lum > 0.55 else "#ffffff"
+
+    def _restyle_color_checkboxes(self):
+        """Tint each contour checkbox with its (primary) contour color + a contrasting text color."""
+        for key, chk in getattr(self, "_color_checkboxes", {}).items():
+            col = getattr(self, self._COLOR_GROUPS[key][0][1])
+            r, g, b = int(col[0]), int(col[1]), int(col[2])
+            chk.setStyleSheet(
+                f"QCheckBox {{ background-color: rgb({r},{g},{b}); color: {self._text_color_for(col)}; "
+                f"padding: 1px 4px; border-radius: 3px; }}")
+
+    def _setup_color_checkboxes(self):
+        """Wire the 6 contour checkboxes for tinting + right-click color editing."""
+        self._color_checkboxes = {
+            "cur_cz": self.chk_cur_cz, "cur_hcr": self.chk_cur_hcr,
+            "other_cz": self.chk_other_cz, "other_hcr": self.chk_other_hcr,
+            "fail_gfp": self.chk_hcr_fail_gfp, "fail_cls": self.chk_hcr_fail_cls,
+        }
+        for key, chk in self._color_checkboxes.items():
+            chk.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+            chk.customContextMenuRequested.connect(
+                lambda _pos, k=key: self._on_contour_color_menu(k))
+            chk.setToolTip((chk.toolTip() + "\n" if chk.toolTip() else "")
+                           + "right-click to change contour color")
+        self._restyle_color_checkboxes()
+
+    def _on_contour_color_menu(self, key):
+        entries = self._COLOR_GROUPS[key]
+        if len(entries) == 1:
+            self._pick_color(entries[0][1])
+            return
+        menu = QtWidgets.QMenu(self)
+        for label, attr in entries:
+            menu.addAction(label, lambda a=attr: self._pick_color(a))
+        menu.exec_(QtGui.QCursor.pos())
+
+    def _pick_color(self, attr):
+        cur = getattr(self, attr)
+        init = QtGui.QColor(int(cur[0]), int(cur[1]), int(cur[2]),
+                            int(cur[3]) if len(cur) > 3 else 255)
+        c = QtWidgets.QColorDialog.getColor(
+            init, self, "Contour color", QtWidgets.QColorDialog.ShowAlphaChannel)
+        if not c.isValid():
+            return
+        setattr(self, attr, (c.red(), c.green(), c.blue(), c.alpha()))
+        self._restyle_color_checkboxes()
+        self._edge_cache.clear()   # colors are baked into the cached edge RGBA -> invalidate
+        self._redraw()
 
     def _set_mode(self, mip: bool):
         self.mip_mode = bool(mip)
