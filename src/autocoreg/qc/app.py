@@ -956,6 +956,97 @@ class QCApp(QtWidgets.QMainWindow):
         self._update_match_buttons()
         self._redraw_contours_only()
 
+    # ---------------- on-demand CZ volume re-warp (apply manual TPS to image + seg) --------
+    def _native_cz_data(self):
+        """Native CZ segmentation labels + 488 image (both ZYX), loaded once and cached.
+        Same sources build_qc_artifacts uses (find_cz_seg_tiff + load_cz_volume)."""
+        if getattr(self, "_native_cz_seg", None) is None:
+            from autocoreg.qc.build_artifacts import find_cz_seg_tiff
+            from autocoreg.io.cz_volume import load_cz_volume
+            seg = tifffile.imread(str(find_cz_seg_tiff(self.sid))).astype(np.int32, copy=False)
+            while seg.ndim > 3 and seg.shape[0] == 1:
+                seg = seg[0]
+            if getattr(self, "s", None) is None:   # warm-cache launch skipped load_subject
+                self.s = load_subject(self.sid)
+            self._native_cz_seg = seg
+            self._native_cz_vol = load_cz_volume(self.s)
+        return self._native_cz_seg, self._native_cz_vol
+
+    def _rewarp_cz_view(self):
+        """Re-resample the warped-CZ background image + CZ ROI segmentation through the
+        CURRENT (manual) landmark TPS, on the existing display grid (cz_bb @ cz_vox — shared
+        by czw and cz_*_arr), replacing the pre-baked ones in memory.  This is the inverse-TPS
+        pass from build_artifacts, but driven by ``active_pairs`` instead of the matches CSV,
+        so the red CZ image + its outlines reflect the manual landmarks (adding a landmark
+        alone only moves the CZ centroid markers).  On-demand: it is a full volume resample.
+        Restored to the baked warp on relaunch (the .tif files on disk are untouched)."""
+        from scipy.interpolate import Rbf
+        from scipy.ndimage import map_coordinates
+        pairs = [(c, h) for c, h in self.active_pairs.items()
+                 if c in self.cz_native_by_id and h in self.hcr_by_id]
+        if len(pairs) < 4:
+            self._notify(f"re-warp needs ≥4 active landmarks (have {len(pairs)})", kind="warn")
+            return
+        nz, ny, nx = self.cz_matched_arr.shape   # display grid (czw shares it exactly)
+        bb, vox = self.cz_bb, self.cz_vox
+        z_lo, y_lo, x_lo = bb["z_lo"], bb["y_lo"], bb["x_lo"]
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            self._notify(f"re-warping CZ view through {len(pairs)} landmarks…", kind="info")
+            QtWidgets.QApplication.processEvents()
+            # Inverse TPS: HCR µm -> CZ-native µm (per build_artifacts._fit_inverse_tps).
+            hcr = np.array([self.hcr_by_id[h] for _, h in pairs], dtype=float)       # (N,3) zyx
+            czn = np.array([self.cz_native_by_id[c] for c, _ in pairs], dtype=float)  # (N,3) zyx
+            rbf = [Rbf(hcr[:, 0], hcr[:, 1], hcr[:, 2], czn[:, a], function="thin_plate")
+                   for a in range(3)]
+            try:
+                cz_seg, cz_vol = self._native_cz_data()
+            except Exception as e:
+                # Re-warp needs the raw CZ seg TIFF + 488 stack under DATA_ROOT; the interactive
+                # QC capsule may only attach the pre-built QC artifacts.  Report, don't crash.
+                import traceback; traceback.print_exc()
+                self._notify(f"re-warp unavailable: native CZ data not found ({type(e).__name__}). "
+                             f"Attach the multiplane-ophys segmentation + CZ z-stack asset.",
+                             kind="err")
+                return
+            y_centers = y_lo + (np.arange(ny) + 0.5) * vox
+            x_centers = x_lo + (np.arange(nx) + 0.5) * vox
+            Y, X = np.meshgrid(y_centers, x_centers, indexing="ij")
+            Y_flat, X_flat = Y.ravel(), X.ravel()
+            warped_cz = np.zeros((nz, ny, nx), dtype=np.int32)
+            warped_img = np.zeros((nz, ny, nx), dtype=np.float32)
+            for k in range(nz):
+                z = z_lo + (k + 0.5) * vox
+                Z_flat = np.full_like(Y_flat, z)
+                cz_z = rbf[0](Z_flat, Y_flat, X_flat) / self.cz_z_um
+                cz_y = rbf[1](Z_flat, Y_flat, X_flat) / self.cz_xy_um
+                cz_x = rbf[2](Z_flat, Y_flat, X_flat) / self.cz_xy_um
+                coords = np.stack([cz_z, cz_y, cz_x])
+                warped_cz[k] = map_coordinates(
+                    cz_seg, coords, order=0, mode="constant", cval=0).reshape(ny, nx)
+                warped_img[k] = map_coordinates(
+                    cz_vol, coords, order=1, mode="constant", cval=0.0).reshape(ny, nx)
+                if k % 8 == 0:
+                    self._notify(f"re-warping CZ view… z {k + 1}/{nz}", kind="info")
+                    QtWidgets.QApplication.processEvents()
+            # Split by the CURRENT matched set (manual adds updated cz_to_hcr) + replace.
+            matched_cz_ids = np.fromiter(
+                (int(c) for c in self.cz_to_hcr.keys()), dtype=np.int32)
+            m = np.isin(warped_cz, matched_cz_ids)
+            self.cz_matched_arr = np.where(m, warped_cz, 0).astype(np.int32)
+            self.cz_unmatched_arr = np.where(~m & (warped_cz > 0), warped_cz, 0).astype(np.int32)
+            self.czw = warped_img
+            self.czw_voxel = vox
+            self.czw_origin = (z_lo, y_lo, x_lo)
+            self.czw_levels = (float(np.percentile(warped_img, AUTO_CLIP_LO)),
+                               float(np.percentile(warped_img, AUTO_CLIP_HI)))
+            self._edge_cache.clear()   # CZ seg changed → drop cached edge overlays
+            self._redraw()
+            self._notify(f"✓ CZ view re-warped through {len(pairs)} landmarks "
+                         f"(relaunch to restore baked warp)", kind="ok")
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
     def _counts_summary(self) -> str:
         return (f"active landmarks: {len(self.active_pairs)}  |  "
                 f"session-added: {len(self.added_order)}")
@@ -1207,6 +1298,17 @@ class QCApp(QtWidgets.QMainWindow):
         self.btn_undo_pair = QtWidgets.QPushButton("Undo last add (Backspace)")
         self.btn_undo_pair.clicked.connect(self._undo_pair)
         mbl.addWidget(self.btn_undo_pair)
+        # On-demand: re-resample the CZ background image + CZ ROI segmentation through the
+        # CURRENT (manual) TPS so the red image + its outlines reflect the added landmarks.
+        # Not per-add — it is a full inverse-TPS volume resample (seconds).
+        self.btn_rewarp = QtWidgets.QPushButton("Re-warp CZ view (apply TPS)")
+        self.btn_rewarp.setToolTip(
+            "Re-resample the warped-CZ image + CZ ROI outlines through the current manual "
+            "landmark TPS, on the display grid. Adding a landmark only moves the CZ centroid "
+            "markers live; this updates the image + contours too. Restored to the baked warp "
+            "on relaunch.")
+        self.btn_rewarp.clicked.connect(self._rewarp_cz_view)
+        mbl.addWidget(self.btn_rewarp)
         self.match_box.setVisible(False)
         pl.addWidget(self.match_box)
 
