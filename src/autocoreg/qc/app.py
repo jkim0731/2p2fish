@@ -1907,10 +1907,12 @@ class QCApp(QtWidgets.QMainWindow):
         self._redraw()
 
     def _z_up(self):
-        self.z_slider.setValue(min(self.z_slider.value() + 1, self.z_slider.maximum()))
+        # "Up" (Up-arrow / wheel-up) = move UP in the tissue = LOWER z (slider step -1).
+        self.z_slider.setValue(max(self.z_slider.value() - 1, 0))
 
     def _z_down(self):
-        self.z_slider.setValue(max(self.z_slider.value() - 1, 0))
+        # "Down" (Down-arrow / wheel-down) = move DOWN in the tissue = HIGHER z (step +1).
+        self.z_slider.setValue(min(self.z_slider.value() + 1, self.z_slider.maximum()))
 
     def eventFilter(self, obj, ev):
         """Wheel = step the slice of the view it is over (main→z, XZ→y, YZ→x); Shift+wheel
