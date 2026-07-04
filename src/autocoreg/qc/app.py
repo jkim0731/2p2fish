@@ -1944,6 +1944,9 @@ class QCApp(QtWidgets.QMainWindow):
                 if dy != 0:
                     d = 1 if dy > 0 else -1
                     if is_main:
+                        # Scroll up (angleDelta>0) = move UP in the tissue = LOWER z; scroll down
+                        # = deeper = higher z.  _z_up()/_z_down() carry this convention (shared
+                        # with the Up/Down arrow keys), so the wheel and arrows always agree.
                         self._z_up() if d > 0 else self._z_down()
                     elif is_xz:
                         self._y_step(d)
@@ -3046,32 +3049,40 @@ class QCApp(QtWidgets.QMainWindow):
         """Accept (or toggle-remove) the matched pair whose CZ and HCR ROIs both cover
         the click point.  Notifies if the click is not on such an overlap.
 
-        Regardless of the accept/remove outcome, the click recenters the linked crosshair on
-        the clicked point and re-slices the XZ/YZ side views there (a no-op when the orthoview
-        is off), so the operator can inspect the clicked location in the orthogonal planes."""
-        # Move the orthoview crosshair (x/y) to the clicked point and re-slice the side views.
-        # Clamp to the cube like the wheel-scroll steppers (_x_step/_y_step) so an out-of-cube
-        # click can't push the crosshair off the data and blank the side planes.  z is left at
-        # the current ROI's plane — a click in the XY MIP carries no z.  _redraw_side_views()
-        # re-slices XZ (along the new y) / YZ (along the new x) and moves every view's crosshair;
-        # it early-returns when the orthoview is off, so fast batching (ortho off) pays nothing.
-        bb = self.cube_bb
-        self.cur_x_world = float(min(max(x, bb["x_lo"]), bb["x_hi"]))
-        self.cur_y_world = float(min(max(y, bb["y_lo"]), bb["y_hi"]))
-        self._redraw_side_views()
+        The click also recenters the linked crosshair + XZ/YZ side views:
+          • On a VALID matched pair the crosshair snaps to that pair's HCR-cell CENTROID (x, y AND
+            z), so it sits dead-center on the accepted cell in every view.
+          • On a miss / non-pair the crosshair x/y track the RAW click (z stays on the current ROI
+            plane — an XY-MIP click carries no z of its own).  x/y are NOT clamped to the queue
+            ROI's ±cube: in batch mode you click cells all over the MIP, and the earlier clamp
+            pinned the crosshair to the cube edge instead of the click.  An off-volume click just
+            blanks the side planes until the next click.
+        _redraw_side_views() re-slices XZ (along the new y) / YZ (along the new x) and moves every
+        view's crosshair; it early-returns when the orthoview is off, so fast batching pays nothing."""
+        self.cur_x_world = float(x)
+        self.cur_y_world = float(y)
         cz = self._label_at_view(self.cz_matched_arr, self.cz_bb, self.cz_vox,
                                  self.cz_vox, x, y)
         hcr = self._label_at_view(self.hcr_matched_arr, self.hbb, self.hcr_vox_xy,
                                   self.hcr_vox_z, x, y)
         if cz is None or hcr is None:
+            self._redraw_side_views()  # still move the x/y crosshair to the click
             self._notify("✗ Not added — click within an overlap of CZ & HCR ROI boundaries",
                          kind="err")
             return
         if self.cz_to_hcr.get(int(cz)) != int(hcr):
+            self._redraw_side_views()
             self._notify(f"✗ Not added — cz{cz} & hcr{hcr} do not form a matched pair here",
                          kind="err")
             return
         cz = int(cz)
+        # Snap the crosshair to the matched HCR cell's centroid (hcr_by_id -> [z, y, x] µm), so it
+        # sits dead-center on the accepted cell in all three views (x/y override the raw click).
+        hc_c = self.hcr_by_id.get(int(hcr))
+        if hc_c is not None:
+            self.cur_z_world = float(hc_c[0])
+            self.cur_y_world = float(hc_c[1])
+            self.cur_x_world = float(hc_c[2])
         if self.labels_state.get(cz) == "good":
             self._remove_label(cz)
             self._notify(f"✗ removed  cz{cz} ↔ hcr{hcr}", kind="warn")
@@ -3079,6 +3090,7 @@ class QCApp(QtWidgets.QMainWindow):
             self._accept_pair_label(cz)
             self._notify(f"✓ accepted  cz{cz} ↔ hcr{hcr}   (QC'd: {len(self.labels_state)})",
                          kind="ok")
+        self._redraw_side_views()   # move crosshair (x/y + snapped z) + re-slice side planes
         self._draw_match_overlay()  # marker-only refresh (contours unchanged) — no lag
 
     def _toggle_batch_accept(self):
