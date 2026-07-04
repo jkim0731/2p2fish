@@ -37,7 +37,8 @@ Keys:
   v          toggle "other HCR ROIs"
   b / n      toggle HCR failed-GFP+ / failed-classifier overlays
   u          toggle add-match mode
-  i          toggle batch-accept (MIP: left-click a CZ/HCR overlap to accept/remove)
+  i          toggle batch-accept (MIP: left-click a CZ/HCR overlap to accept/remove; the
+             click also recenters the linked crosshair + XZ/YZ side views on the clicked point)
   Enter      next ROI if labeled (QC mode) / add pending pair (add-match mode)
   Shift+right-click   report CZ + HCR ROI IDs overlapping the point
   right-click         context menu: "Show IDs" + "QC CZ <id>" submenu for the CZ ROI under
@@ -1425,7 +1426,8 @@ class QCApp(QtWidgets.QMainWindow):
         pl.addWidget(self.chk_add_match)
         self.chk_batch = QtWidgets.QCheckBox("Batch-accept MIP (i)")
         self.chk_batch.setToolTip("MIP mode: left-click a CZ/HCR overlap to accept "
-                                  "(label good); click again to remove.")
+                                  "(label good); click again to remove.  The click also "
+                                  "recenters the crosshair + XZ/YZ side views on that point.")
         self.chk_batch.setChecked(False)
         self.chk_batch.stateChanged.connect(lambda _: self._toggle_batch_accept())
         pl.addWidget(self.chk_batch)
@@ -3042,7 +3044,21 @@ class QCApp(QtWidgets.QMainWindow):
 
     def _batch_click(self, x, y):
         """Accept (or toggle-remove) the matched pair whose CZ and HCR ROIs both cover
-        the click point.  Notifies if the click is not on such an overlap."""
+        the click point.  Notifies if the click is not on such an overlap.
+
+        Regardless of the accept/remove outcome, the click recenters the linked crosshair on
+        the clicked point and re-slices the XZ/YZ side views there (a no-op when the orthoview
+        is off), so the operator can inspect the clicked location in the orthogonal planes."""
+        # Move the orthoview crosshair (x/y) to the clicked point and re-slice the side views.
+        # Clamp to the cube like the wheel-scroll steppers (_x_step/_y_step) so an out-of-cube
+        # click can't push the crosshair off the data and blank the side planes.  z is left at
+        # the current ROI's plane — a click in the XY MIP carries no z.  _redraw_side_views()
+        # re-slices XZ (along the new y) / YZ (along the new x) and moves every view's crosshair;
+        # it early-returns when the orthoview is off, so fast batching (ortho off) pays nothing.
+        bb = self.cube_bb
+        self.cur_x_world = float(min(max(x, bb["x_lo"]), bb["x_hi"]))
+        self.cur_y_world = float(min(max(y, bb["y_lo"]), bb["y_hi"]))
+        self._redraw_side_views()
         cz = self._label_at_view(self.cz_matched_arr, self.cz_bb, self.cz_vox,
                                  self.cz_vox, x, y)
         hcr = self._label_at_view(self.hcr_matched_arr, self.hbb, self.hcr_vox_xy,
