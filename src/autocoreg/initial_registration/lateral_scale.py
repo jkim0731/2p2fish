@@ -97,6 +97,7 @@ PRODUCTION sxy entry point (promoted 2026-06-04)
 from __future__ import annotations
 
 import glob
+import os
 import pickle
 import time
 from pathlib import Path
