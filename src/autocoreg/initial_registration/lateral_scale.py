@@ -197,6 +197,11 @@ def _hcr_metrics_path(sid: str) -> Path:
         str(_config.DATA_ROOT / f"HCR_{sid}_*/cell_body_segmentation/metrics.pickle")
     ))
     if not hits:
+        hcr_dir = os.environ.get("MFISH_HCR_DIR")
+        if hcr_dir:
+            p = Path(hcr_dir) / "cell_body_segmentation" / "metrics.pickle"
+            if p.exists():
+                return p
         raise FileNotFoundError(f"HCR cell_body_segmentation/metrics.pickle for {sid}")
     return Path(hits[-1])
 
@@ -206,6 +211,11 @@ def _hcr_seg_zarr_path(sid: str) -> Path:
         str(_config.DATA_ROOT / f"HCR_{sid}_*/cell_body_segmentation/segmentation_mask.zarr")
     ))
     if not hits:
+        hcr_dir = os.environ.get("MFISH_HCR_DIR")
+        if hcr_dir:
+            p = Path(hcr_dir) / "cell_body_segmentation" / "segmentation_mask.zarr"
+            if p.exists():
+                return p
         raise FileNotFoundError(f"HCR cell_body_segmentation/segmentation_mask.zarr for {sid}")
     return Path(hits[-1])
 
@@ -215,6 +225,11 @@ def _hcr_centroids_npy_path(sid: str) -> Path:
         str(_config.DATA_ROOT / f"HCR_{sid}_*/cell_body_segmentation/cell_centroids.npy")
     ))
     if not hits:
+        hcr_dir = os.environ.get("MFISH_HCR_DIR")
+        if hcr_dir:
+            p = Path(hcr_dir) / "cell_body_segmentation" / "cell_centroids.npy"
+            if p.exists():
+                return p
         raise FileNotFoundError(f"HCR cell_body_segmentation/cell_centroids.npy for {sid}")
     return Path(hits[-1])
 
