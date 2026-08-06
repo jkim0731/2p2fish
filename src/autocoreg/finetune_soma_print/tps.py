@@ -5,15 +5,55 @@ iterative protocol (now archived at autocoreg.archive.iterative_matcher).
 """
 from __future__ import annotations
 
+import os
 import numpy as np
 from scipy.interpolate import Rbf
-from scipy.spatial import cKDTree
+from scipy.spatial import cKDTree, ConvexHull
 
 from autocoreg.finetune_soma_print.descriptor import cell_vectors
 
 
+# --- Bounded-extrapolation control (see fit_tps/apply_tps) ------------------
+# The thin-plate kernel r^2*log(r) grows super-linearly, so *outside* the
+# anchor cloud the warp extrapolates without bound. That unbounded drag is the
+# mechanism by which a slab of cells lying just beyond the anchor hull (e.g. the
+# deepest CZ z-plane whose true HCR partners fall outside the reliable overlap)
+# gets pulled by a large, coherent vector onto a translated constellation and
+# then locked in as anchors. We therefore blend the exact thin-plate warp
+# (trustworthy INSIDE the anchor source hull) toward a robust global affine
+# continuation (bounded) OUTSIDE it. w=1 strictly inside the hull -> the warp is
+# BIT-IDENTICAL to the pure-TPS behaviour for every interior point (hence no
+# change to any in-hull / benchmark match); w->0 beyond it.
+TPS_EXTRAP_TAU_UM = 40.0     # blend decay length (um) once past the grace zone
+# GRACE ZONE: keep the exact thin-plate warp (w=1) until this far OUTSIDE the hull,
+# then decay to affine. Normal near-hull extrapolation (a real peripheral cell sits
+# ≲1 candidate-radius beyond the anchor hull) is left UNTOUCHED — so the fix is inert
+# on well-covered/sparse pools — while the pathological far drag (a deep orphan sheet
+# pulled ~130µm out) is still bounded. Sized to the adaptive_r_cand floor (~50µm), not
+# a magic constant. (margin<0 ⇒ grace outside the hull; the blend uses clip(sd+margin,0,∞).)
+TPS_EXTRAP_MARGIN_UM = -50.0
+
+
+def _fit_robust_affine(src_zyx: np.ndarray, dst_zyx: np.ndarray,
+                       n_iter: int = 2) -> np.ndarray:
+    """Robust affine A (4x3, row-vec: dst ~= [src,1] @ A) via IRLS, so the
+    ~majority of correct anchors dominate and a small coherent bad block barely
+    moves it. Same robust-linear pattern used elsewhere in the pipeline."""
+    X = np.column_stack([src_zyx, np.ones(len(src_zyx))])
+    w = np.ones(len(src_zyx))
+    A = np.linalg.lstsq(X, dst_zyx, rcond=None)[0]
+    for _ in range(n_iter):
+        res = np.linalg.norm(dst_zyx - X @ A, axis=1)
+        s = np.median(res) + 1e-6
+        w = 1.0 / (1.0 + (res / (2.5 * s)) ** 2)
+        Wr = np.sqrt(w)[:, None]
+        A = np.linalg.lstsq(X * Wr, dst_zyx * Wr, rcond=None)[0]
+    return A
+
+
 def fit_tps(src_zyx: np.ndarray, dst_zyx: np.ndarray) -> dict | None:
-    """Per-axis thin-plate Rbf src → dst."""
+    """Per-axis thin-plate Rbf src → dst, plus a robust global affine and the
+    anchor-source convex hull so ``apply_tps`` can bound extrapolation."""
     if len(src_zyx) < 4:
         return None
     try:
@@ -25,13 +65,38 @@ def fit_tps(src_zyx: np.ndarray, dst_zyx: np.ndarray) -> dict | None:
                   dst_zyx[:, 2], function="thin_plate")
     except Exception:
         return None
-    return dict(rbf_z=rz, rbf_y=ry, rbf_x=rx, src=src_zyx, dst=dst_zyx)
+    try:
+        affine = _fit_robust_affine(src_zyx, dst_zyx)
+    except Exception:
+        affine = None
+    try:
+        hull_eqs = ConvexHull(src_zyx).equations  # (n_faces, 4); a.x + b = signed dist
+    except Exception:
+        hull_eqs = None
+    return dict(rbf_z=rz, rbf_y=ry, rbf_x=rx, src=src_zyx, dst=dst_zyx,
+                affine=affine, hull_eqs=hull_eqs,
+                tau=TPS_EXTRAP_TAU_UM, margin=TPS_EXTRAP_MARGIN_UM)
+
 
 def apply_tps(tps: dict, pts_zyx: np.ndarray) -> np.ndarray:
-    z = tps["rbf_z"](pts_zyx[:, 0], pts_zyx[:, 1], pts_zyx[:, 2])
-    y = tps["rbf_y"](pts_zyx[:, 0], pts_zyx[:, 1], pts_zyx[:, 2])
-    x = tps["rbf_x"](pts_zyx[:, 0], pts_zyx[:, 1], pts_zyx[:, 2])
-    return np.column_stack([z, y, x])
+    pts = np.asarray(pts_zyx, dtype=float)
+    tps_pred = np.column_stack([
+        tps["rbf_z"](pts[:, 0], pts[:, 1], pts[:, 2]),
+        tps["rbf_y"](pts[:, 0], pts[:, 1], pts[:, 2]),
+        tps["rbf_x"](pts[:, 0], pts[:, 1], pts[:, 2]),
+    ])
+    # Legacy warps (or degenerate hull), or the bound disabled -> pure thin-plate.
+    affine = tps.get("affine"); hull_eqs = tps.get("hull_eqs")
+    if affine is None or hull_eqs is None or os.environ.get("MFISH_TPS_BOUND", "1") == "0":
+        return tps_pred
+    tau = float(tps.get("tau", TPS_EXTRAP_TAU_UM))
+    margin = float(tps.get("margin", TPS_EXTRAP_MARGIN_UM))
+    affine_pred = np.column_stack([pts, np.ones(len(pts))]) @ affine
+    # signed distance to the anchor-source hull: >0 outside, <=0 inside.
+    sd = (pts @ hull_eqs[:, :3].T + hull_eqs[:, 3]).max(axis=1)
+    over = np.clip(sd + margin, 0.0, None)
+    w = np.exp(-(over / tau) ** 2)          # w=1 inside hull -> exact TPS (bit-identical)
+    return w[:, None] * tps_pred + (1.0 - w)[:, None] * affine_pred
 
 def soma_score_with_neighbour_indices(
     cz_zyx: np.ndarray, hcr_zyx: np.ndarray,

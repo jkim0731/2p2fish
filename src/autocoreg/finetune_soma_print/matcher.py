@@ -50,7 +50,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy.interpolate import Rbf
-from scipy.spatial import cKDTree
+from scipy.spatial import cKDTree, ConvexHull
 from scipy.stats import norm
 from sklearn.mixture import GaussianMixture
 
@@ -85,6 +85,18 @@ MIN_LANDMARKS_FOR_ABORT = 20
 # Round-0-only pre-filter defaults (overridden by --no_local_flow_rd0)
 LOCAL_FLOW_K = 15
 LOCAL_FLOW_QUANTILE = 0.90
+
+# Anchor-support gate (every round, both stages): a candidate may only be
+# promoted to an ANCHOR if its CZ source position lies within the convex hull of
+# the PREVIOUS round's accepted-anchor source points, plus this margin. This is
+# a hard, subtractive-only guarantee that a cell dragged OUTSIDE the trustworthy
+# (interpolated) support region — e.g. the deepest CZ slab whose true HCR
+# partner is beyond the overlap — can never anchor the TPS and lock in a fold.
+# Keyed off the PREVIOUS round's accepted set, so it is non-circular (last
+# round's clean hull never contains a freshly-dragged orphan). The generous
+# margin (= R_CAND_UM) means on densely-covered pools every match is well inside
+# the hull and 0 pairs are rejected — so it is inert on the sparse benchmark.
+SUPPORT_HULL_MARGIN_UM = 150.0
 
 # Primary gate: LR
 LIKELIHOOD_RATIO_THRESHOLD = 0.05
@@ -266,6 +278,33 @@ def local_flow_filter(
     kept_mask = devs <= thr
     kept = [mb_pairs[k_] for k_, keep in enumerate(kept_mask) if keep]
     return kept, devs
+
+
+def support_gate(
+    pairs: list[tuple[int, int]],
+    cz_src: np.ndarray,
+    ref_pairs,
+    margin: float = SUPPORT_HULL_MARGIN_UM,
+) -> list[tuple[int, int]]:
+    """Keep only ``pairs`` whose CZ source point (``cz_src[i]``) lies within the
+    convex hull of ``ref_pairs``' CZ source points, expanded by ``margin`` µm.
+
+    ``ref_pairs`` = the PREVIOUS round's accepted anchor set. Prevents a
+    candidate whose CZ cell was warped OUTSIDE the trustworthy interpolation
+    region from being promoted to an anchor (which would let it — via the
+    unbounded thin-plate extrapolation — lock in a local fold). Inert when the
+    reference set is too small/degenerate or when every candidate is in-hull.
+    """
+    if len(pairs) == 0 or len(ref_pairs) < 4 or os.environ.get("MFISH_TPS_BOUND", "1") == "0":
+        return pairs
+    ref = np.asarray([cz_src[i] for (i, _) in ref_pairs], dtype=float)
+    try:
+        eqs = ConvexHull(ref).equations           # (n_faces, 4)
+    except Exception:
+        return pairs
+    pts = np.asarray([cz_src[i] for (i, _) in pairs], dtype=float)
+    sd = (pts @ eqs[:, :3].T + eqs[:, 3]).max(axis=1)   # >0 outside the hull
+    return [p for p, d in zip(pairs, sd) if d <= margin]
 
 
 def likelihood_ratio_filter(
@@ -613,6 +652,14 @@ def run_subject(
             raise ValueError(f"unknown gate: {gate!r}")
         n_filtered_gate = n_before_gate - len(kept)
 
+        # ── Anchor-support gate (rounds ≥1): reject candidates dragged outside
+        #    the previous round's trustworthy (interpolated) support region.
+        #    `accepted` here still holds the PREVIOUS round's set (reassigned
+        #    below); round 0 has an empty ref set so nothing is dropped. ───────
+        n_before_support = len(kept)
+        kept = support_gate(kept, cz_zyx_lp, accepted, SUPPORT_HULL_MARGIN_UM)
+        n_filtered_support = n_before_support - len(kept)
+
         # ── Re-evaluate accepted set (no locking) ─────────────────────────────
         prev_accepted = accepted
         accepted = set(kept)
@@ -752,6 +799,10 @@ def run_subject(
                     w_base, cz_cur, hcr_zyx,
                     frac_threshold=anchor_vote_frac,
                 )
+                # Anchor-support gate (same as Stage-1), keyed off the previous
+                # Stage-2 accepted set's source hull.
+                w_kept = support_gate(w_kept, cz_zyx_lp, ar_accepted,
+                                      SUPPORT_HULL_MARGIN_UM)
 
                 # Re-evaluate (no locking).
                 w_prev = ar_accepted
