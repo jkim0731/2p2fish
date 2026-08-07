@@ -37,11 +37,20 @@ from typing import Optional
 
 import numpy as np
 
+from autocoreg import config as _config
 from autocoreg.io.subjects import HCR_SEG_XY_DOWNSAMPLE
 from autocoreg.initial_registration.coarse_align import _plane_normal_from_surface, _rotation_about_z_row, _rotation_between_row, _surface_z_at
+from autocoreg.initial_registration.cz_surface import get_cz_pia_surface_panneuronal
+from autocoreg.initial_registration.register_2d import rotate_point_forward
 from autocoreg.initial_registration.surface_registration import get_surface_registration
 from autocoreg.initial_registration.surfaces import get_cz_surface_iter08, get_hcr_top_surface_iter07
 
+# Benchmark structural CZ-vs-HCR mounting prior — the rotation
+# `warm_start_cz_binary` bakes into `cz_bin_warm` by default. Used ONLY as
+# the fallback when `registration` lacks the `rot_deg_warm` key (caches
+# computed before that field existed); every registration computed after
+# this change carries its own `rot_deg_warm` (180° benchmark / 0°
+# pan-neuronal), which is what actually drives the pose below.
 PRIOR_ROTATION_DEG_Z = 180.0
 
 # Stage A's sz prior: HCR_mean_depth_below_pia / CZ_mean_depth_below_pia
@@ -108,24 +117,36 @@ def _affine_centroid_translation_um(
     The pipeline used by `surface_registration_v2`:
 
       cz_bin (CZ-px)          shape (H_b, W_b),  1 px = cz_xy_um µm
-        ↓ nd_rotate 180° (reshape=True)            same shape
-      rot           : (i, j) ↔ (H_b-1-i, W_b-1-j) in cz_bin
+        ↓ nd_rotate rot_deg_warm (reshape=True)     shape (H_rot, W_rot)
+      rot           : (i, j) ↔ scipy.ndimage.rotate's exact geometry
         ↓ zoom by f = cz_xy_um*sxy/hcr_xy_um
       cz_warm       shape (H_w, W_w),  1 px = hcr_xy_um µm
         ↓ M, offset (scipy: p_in_warm = M @ p_out_crop + offset)
       cropped HCR   1 px = hcr_xy_um µm, origin at crop_bbox[y0,x0]
         + [y0, x0] → HCR-full level-4 pixel grid
         × hcr_xy_um → absolute HCR µm.
+
+    Step 2 (the rotation) used to be hardcoded to 180°. It is now driven
+    by `reg["rot_deg_warm"]` — the pre-rotation `warm_start_cz_binary`
+    actually baked into `cz_bin_warm` (180° for the benchmark structural
+    prior, 0° for pan-neuronal subjects, whose true rotation instead comes
+    out of `stage1_rigid`'s full 360° search). For `rot_deg_warm == 180°`
+    we keep the exact legacy reflection formula `(H_b-1-i, W_b-1-j)` — a
+    180° `reshape=True` rotation never changes the array shape, so
+    `cz_bin`'s shape is exactly recoverable from `cz_warm_shape / f` and
+    the benchmark pose is reproduced byte-for-byte. Any other angle
+    generally DOES change the shape, so it uses `rotate_point_forward`
+    (exact scipy geometry) against the true pre-rotation `cz_bin` shape,
+    cached as `reg["cz_bin_shape"]` (present on registrations computed
+    after this change).
     """
     cz_xy_um = float(s.cz_xy_um)
     hcr_xy_um = float(reg["hcr_xy_um"])
     cz_warm_h, cz_warm_w = reg["cz_warm_shape"]
     y0, _, x0, _ = reg["crop_bbox"]
+    rot_deg_warm = float(reg.get("rot_deg_warm", PRIOR_ROTATION_DEG_Z))
 
     f = (cz_xy_um * sxy) / hcr_xy_um  # cz_bin → cz_warm zoom factor
-    # cz_bin shape recovered from cz_warm shape (round-trip through scipy.zoom)
-    H_b = int(round(cz_warm_h / f))
-    W_b = int(round(cz_warm_w / f))
 
     cz = s.cz_centroids[["y_px", "x_px"]].to_numpy(float)
     cz_mean_y_um = float(cz[:, 0].mean()) * cz_xy_um
@@ -134,9 +155,27 @@ def _affine_centroid_translation_um(
     # 1. CZ µm → cz_bin px.
     y_b = cz_mean_y_um / cz_xy_um
     x_b = cz_mean_x_um / cz_xy_um
-    # 2. 180° rotation about cz_bin centre.
-    y_rot = (H_b - 1) - y_b
-    x_rot = (W_b - 1) - x_b
+
+    # 2. warm-start rotation about the cz_bin centre (reshape=True).
+    if rot_deg_warm == PRIOR_ROTATION_DEG_Z:
+        # Legacy exact path — cz_bin shape recovered from cz_warm shape
+        # (round-trip through scipy.zoom; valid because 180° reshape=True
+        # never changes the shape).
+        H_b = int(round(cz_warm_h / f))
+        W_b = int(round(cz_warm_w / f))
+        y_rot = (H_b - 1) - y_b
+        x_rot = (W_b - 1) - x_b
+    else:
+        cz_bin_shape = reg.get("cz_bin_shape")
+        if cz_bin_shape is None:
+            raise KeyError(
+                "reg['cz_bin_shape'] is required to invert a non-180° "
+                "warm-start rotation but is absent from this cached "
+                "registration — recompute via compute_surface_registration."
+            )
+        y_rot, x_rot, _ = rotate_point_forward(
+            y_b, x_b, tuple(cz_bin_shape), rot_deg_warm)
+
     # 3. Zoom by f → cz_warm px.
     yr_pix = y_rot * f
     xr_pix = x_rot * f
@@ -250,14 +289,31 @@ def compute_locked_prior_warm_start(
     if registration is None:
         registration = get_surface_registration(s)
 
+    # Warm-start pre-rotation actually baked into `registration`'s
+    # cz_bin_warm by `warm_start_cz_binary` — 180° for the benchmark
+    # structural mounting prior; 0° for pan-neuronal subjects, whose true
+    # rotation instead comes entirely out of stage1_rigid's full 360°
+    # search (`methods.rigid.theta_deg` below). Falls back to the
+    # benchmark constant for registrations cached before this field
+    # existed, so the benchmark pose is unaffected.
+    rot_deg_warm = float(registration.get("rot_deg_warm", PRIOR_ROTATION_DEG_Z))
+
     # ---- Surfaces ----
-    cz_surface = get_cz_surface_iter08(s)
+    # Pan-neuronal subjects need the same cell-density onset CZ surface
+    # `compute_surface_registration` used (the sparse-cell iter08 detector
+    # does not hold for dense pan-neuronal stacks) — both call sites hit
+    # the same on-disk cache, so the tilt/pia used here for R_tilt / the
+    # t_z pia anchor exactly matches the one used at registration time.
+    cz_surface = (
+        get_cz_pia_surface_panneuronal(s) if _config.is_panneuronal(sid)
+        else get_cz_surface_iter08(s)
+    )
     hcr_surface = get_hcr_top_surface_iter07(s)
 
     # ---- sxy ----
     sxy, sxy_source = resolve_sxy(s, registration=registration)
 
-    # ---- R = R_180 @ R_tilt(cz_normal -> hcr_normal) [@ R_pwr_theta] ----
+    # ---- R = R_warm @ R_tilt(cz_normal -> hcr_normal) [@ R_pwr_theta] ----
     cz_xy = np.column_stack([
         s.cz_centroids["x_px"].to_numpy(float) * float(s.cz_xy_um),
         s.cz_centroids["y_px"].to_numpy(float) * float(s.cz_xy_um),
@@ -271,19 +327,24 @@ def compute_locked_prior_warm_start(
 
     # Build R in xyz row-vec convention (matches the helpers + the surface
     # normals which are returned as (n_x, n_y, n_z)).
-    R_180 = _rotation_about_z_row(PRIOR_ROTATION_DEG_Z)
-    n_cz_rot = n_cz @ R_180
+    R_warm = _rotation_about_z_row(rot_deg_warm)
+    n_cz_rot = n_cz @ R_warm
     R_tilt = _rotation_between_row(n_cz_rot, n_hcr)
-    R_xyz = R_180 @ R_tilt
+    R_xyz = R_warm @ R_tilt
     if use_pwr_residual_theta:
         theta_pwr = float(registration["methods"]["rigid"]["theta_deg"])
-        # The PWR rigid theta is in the 2-D image plane; add it as a small
-        # rotation about Z on top of the 180° flip.
+        # The stage1_rigid theta is in the 2-D image plane; add it as a
+        # small rotation about Z on top of the warm-start pre-rotation.
+        # Together (rot_deg_warm + theta_pwr) is the TOTAL 2-D rotation
+        # actually applied to the CZ — for pan-neuronal (rot_deg_warm=0)
+        # this total is the whole rotation (session 24: ~277° for
+        # 837568); for the benchmark (rot_deg_warm=180) it reproduces the
+        # previous behaviour exactly.
         R_pwr = _rotation_about_z_row(theta_pwr)
         R_xyz = R_xyz @ R_pwr
-        rot_deg_z = PRIOR_ROTATION_DEG_Z + theta_pwr
+        rot_deg_z = rot_deg_warm + theta_pwr
     else:
-        rot_deg_z = PRIOR_ROTATION_DEG_Z
+        rot_deg_z = rot_deg_warm
 
     # Convert R to zyx row-vec so it matches src_mean / scales / translation
     # (all stored in zyx).  P is the anti-diagonal permutation; R_zyx =

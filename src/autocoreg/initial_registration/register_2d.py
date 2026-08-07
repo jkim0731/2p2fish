@@ -29,6 +29,7 @@ from pathlib import Path
 
 import numpy as np
 import tifffile
+from scipy import special
 from scipy.ndimage import (
     affine_transform,
     binary_fill_holes,
@@ -144,18 +145,65 @@ def detect_objects_binary(
 
 
 # --------------------------------------------------------------
-# Warm start: 180° + sxy scale → HCR pixel grid
+# Warm start: rotation + sxy scale → HCR pixel grid
 # --------------------------------------------------------------
 def warm_start_cz_binary(
     cz_bin: np.ndarray, cz_xy_um: float, hcr_xy_um: float, sxy: float,
+    rot_deg: float = 180.0,
 ) -> np.ndarray:
+    """Rotate the CZ binary by ``rot_deg`` (reshape=True) then rescale by
+    ``sxy`` onto the HCR pixel grid.
+
+    ``rot_deg`` defaults to 180 deg — the benchmark's structural CZ-vs-HCR
+    mounting prior. Pan-neuronal subjects pass ``rot_deg=0.0`` because
+    their true in-plane rotation is not assumed a priori; it is instead
+    found by ``stage1_rigid(..., full_search=True)``'s full 360 deg sweep
+    (session 24; e.g. ~277 deg for subject 837568).
+    """
     rot = nd_rotate(
-        cz_bin.astype(np.float32), 180.0, reshape=True, order=0,
+        cz_bin.astype(np.float32), float(rot_deg), reshape=True, order=0,
         mode="constant", cval=0.0,
     )
     f = (cz_xy_um * sxy) / hcr_xy_um
     z = zoom(rot, f, order=0)
     return (z > 0.5).astype(np.uint8)
+
+
+def rotate_point_forward(
+    y: float, x: float, in_shape: tuple, angle_deg: float,
+) -> tuple:
+    """Map point ``(y, x)`` in an ``in_shape`` array to its coordinate in
+    the array ``scipy.ndimage.rotate(arr, angle_deg, reshape=True)`` would
+    produce (2-D, default ``axes``).
+
+    ``scipy.ndimage.rotate``'s own ``matrix``/``offset`` map OUTPUT
+    coordinates to INPUT coordinates (it pull-samples the input for every
+    output pixel), which is the opposite of what a point transform needs —
+    this reproduces that exact internal geometry (rotation matrix,
+    reshape=True bounding box, and centering offset; see
+    ``scipy.ndimage._interpolation.rotate``) and inverts it, rather than
+    re-deriving rotation-plus-reshape independently. Used by
+    ``locked_prior._affine_centroid_translation_um`` to invert an
+    arbitrary (non-180 deg) ``warm_start_cz_binary`` rotation.
+
+    Verified against actual ``nd_rotate`` output on synthetic single-pixel
+    images across multiple angles (0/37/90/123/180/270/277/-45 deg); for
+    180 deg it reproduces the legacy hardcoded reflection formula
+    ``(H-1-y, W-1-x)`` exactly.
+
+    Returns ``(y_out, x_out, (H_out, W_out))``.
+    """
+    H, W = in_shape
+    c, s = special.cosdg(angle_deg), special.sindg(angle_deg)
+    rot_matrix = np.array([[c, s], [-s, c]])
+    corners = np.array([[0, 0, H, H], [0, W, 0, W]], dtype=float)
+    out_bounds = rot_matrix @ corners
+    out_shape = (np.ptp(out_bounds, axis=1) + 0.5).astype(int)
+    out_center = rot_matrix @ ((out_shape - 1) / 2.0)
+    in_center = (np.array([H, W], dtype=float) - 1) / 2.0
+    offset = in_center - out_center
+    o = np.linalg.solve(rot_matrix, np.array([y, x], dtype=float) - offset)
+    return float(o[0]), float(o[1]), (int(out_shape[0]), int(out_shape[1]))
 
 
 # --------------------------------------------------------------
@@ -198,9 +246,22 @@ def ncc_overlap(a: np.ndarray, b: np.ndarray, mask: np.ndarray) -> float:
 # --------------------------------------------------------------
 # Stage 1 — rigid (FFT-NCC θ sweep)
 # --------------------------------------------------------------
-def stage1_rigid(template: np.ndarray, image: np.ndarray) -> dict:
+def stage1_rigid(
+    template: np.ndarray, image: np.ndarray, full_search: bool = False,
+) -> dict:
+    """FFT-NCC rotation sweep. ``full_search=False`` (default, unchanged
+    benchmark behaviour) sweeps theta in [-30, 30] deg — valid once the
+    ~180 deg warm-start prior has already removed the large rotation.
+    ``full_search=True`` sweeps the full circle instead: pan-neuronal
+    subjects warm-start with no pre-rotation (``rot_deg=0``), so their
+    true rotation (session 24: ~277 deg for 837568) is not assumed to be
+    near 0 and must be found from scratch.
+    """
     image_f = image.astype(np.float32)
-    coarse = np.arange(-30.0, 30.0 + 1e-9, 2.0)
+    coarse = (
+        np.arange(0.0, 360.0, 3.0) if full_search
+        else np.arange(-30.0, 30.0 + 1e-9, 2.0)
+    )
     fine_pad, fine_step = 3.0, 0.25
 
     def sweep(thetas):

@@ -208,6 +208,136 @@ def detect_transitions(vol, z_um, grid_ix, grid_iy, patch_w=PATCH_W):
     return zs, thrs
 
 
+# ============================================================
+# Pan-neuronal HCR GFP+ L1/L2 onset (session 23; e.g. subject 837568-01)
+# ============================================================
+# Companion to `cz_surface.compute_cz_pia_surface_panneuronal`: the CZ side
+# finds L1/L2 as the onset of a GCaMP cell-density rise measured from a
+# density-derived pia; the HCR side finds the *same* onset rule from the
+# GFP+ ROI-density rise, measured as depth below the HCR image pia
+# (`hcr_top_iter07`) so both sides share one depth reference. GFP+ is used
+# (rather than all/ok ROIs) because CZ GCaMP cells are HCR GFP+, and
+# session 23 found the superficial/pia region is filter-dependent (all-ROI
+# carries a surface-artifact density spike GFP+ does not).
+
+# Depth-below-pia histogram range spanning the full HCR cortical column
+# (pia to white matter, session 23); fixed rather than data-derived
+# because depth is already anchored at the image pia (depth 0).
+HCR_L1L2_DEPTH_LO_UM = -150.0
+HCR_L1L2_DEPTH_HI_UM = 900.0
+HCR_L1L2_DEPTH_BIN_UM = 6.0
+HCR_L1L2_SMOOTH_SIGMA_BINS = 1.2
+
+# Steepest-rise search zone: excludes the pia/superficial band (a
+# surface-artifact spike sits there for all/ok ROIs — session 23) and the
+# deep dense-L2 plateau.
+HCR_L1L2_SEARCH_LO_UM = 70.0
+HCR_L1L2_SEARCH_HI_UM = 320.0
+
+# L1/L2 boundary = ONSET (foot) of the rise: starting from the steepest-
+# rise point, walk shallower until the gradient first drops below this
+# fraction of its peak.
+HCR_L1L2_GRADIENT_FRAC = 0.25
+
+# Minimum GFP+ cells required before trusting the onset detector (session
+# 23 ran this on 50,009 GFP+ cells for 837568-01; far below that the depth
+# histogram is too noisy for a stable gradient foot).
+HCR_L1L2_MIN_GFP_CELLS = 500
+
+
+def hcr_l1l2_onset_from_depths(
+    depth_below_pia_um,
+    *,
+    lo_um: float = HCR_L1L2_SEARCH_LO_UM,
+    hi_um: float = HCR_L1L2_SEARCH_HI_UM,
+    depth_range: tuple = (HCR_L1L2_DEPTH_LO_UM, HCR_L1L2_DEPTH_HI_UM),
+    bin_um: float = HCR_L1L2_DEPTH_BIN_UM,
+    smooth_sigma_bins: float = HCR_L1L2_SMOOTH_SIGMA_BINS,
+    gradient_frac: float = HCR_L1L2_GRADIENT_FRAC,
+) -> dict | None:
+    """L1/L2 boundary = ONSET (foot) of the L1->L2 ROI-density rise, given
+    per-cell depths below the HCR image pia (session 23 HCR L1/L2 notebook).
+
+    Locates the steepest-rise depth within ``[lo_um, hi_um]``, then walks
+    shallower until the gradient first drops below ``gradient_frac`` of
+    its peak — that foot is the boundary (top of L2), shallower than the
+    steepest-rise point. Returns ``None`` if the search zone has no cells
+    to find a rise in.
+    """
+    depth = np.asarray(depth_below_pia_um, dtype=float)
+    depth = depth[np.isfinite(depth)]
+    if depth.size == 0:
+        return None
+    edges = np.arange(depth_range[0], depth_range[1] + bin_um, bin_um)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    hist, _ = np.histogram(depth, bins=edges)
+    density = gaussian_filter1d(hist.astype(float), smooth_sigma_bins)
+    gradient = np.gradient(density)
+    zone = np.where((centers > lo_um) & (centers < hi_um))[0]
+    if zone.size == 0 or not np.any(density[zone] > 0):
+        return None
+    gi = zone[int(np.argmax(gradient[zone]))]
+    thr = gradient_frac * gradient[gi]
+    i = gi
+    while i - 1 >= zone[0] and gradient[i - 1] >= thr:
+        i -= 1
+    return dict(
+        onset_um=float(centers[i]),
+        steepest_rise_um=float(centers[gi]),
+        peak_gradient=float(gradient[gi]),
+        n_cells=int(depth.size),
+    )
+
+
+def compute_hcr_gfp_l1_thickness_panneuronal(
+    s, hcr_top_surface: dict | None = None,
+) -> dict | None:
+    """GFP+ onset L1 thickness below the HCR image pia, for pan-neuronal
+    subjects (session 23; the GFP+ population matches the CZ GCaMP cells).
+
+    Loads every HCR centroid, restricts to GFP+ via
+    ``autocoreg.io.inputs.strict_gfp_ids`` (the same GMM-intersection
+    cutoff used elsewhere in the pipeline), computes each GFP+ cell's
+    depth below ``hcr_top_surface`` (default
+    ``surfaces.get_hcr_top_surface_iter07(s)``), and applies
+    ``hcr_l1l2_onset_from_depths``. Returns ``None`` if the pia surface or
+    the GFP+ population is unavailable / too small.
+    """
+    # Lazy imports: `surfaces.py` imports FROM this module at module
+    # scope, so `get_hcr_top_surface_iter07` can't be imported back here
+    # at module scope without a cycle; io.* is lazy simply to keep this
+    # module's import-time footprint light (matches the rest of the file).
+    from autocoreg.initial_registration.surfaces import get_hcr_top_surface_iter07
+    from autocoreg.io.centroids import centroids_um
+    from autocoreg.io.hcr_image import depth_from_surface
+    from autocoreg.io.inputs import strict_gfp_ids
+
+    if hcr_top_surface is None:
+        hcr_top_surface = get_hcr_top_surface_iter07(s)
+    if hcr_top_surface is None:
+        return None
+
+    hcr_zyx_um, hcr_ids = centroids_um(s, "hcr_all")
+    gfp_ids, gfp_meta = strict_gfp_ids(s.subject_id)
+    gfp_id_arr = np.fromiter(gfp_ids, dtype=np.int64, count=len(gfp_ids))
+    keep = np.isin(hcr_ids, gfp_id_arr)
+    if int(keep.sum()) < HCR_L1L2_MIN_GFP_CELLS:
+        return None
+
+    hcr_xyz_um = hcr_zyx_um[keep][:, [2, 1, 0]]  # depth_from_surface wants (x, y, z)
+    depth_below_pia = depth_from_surface(hcr_xyz_um, hcr_top_surface)
+
+    onset = hcr_l1l2_onset_from_depths(depth_below_pia)
+    if onset is None:
+        return None
+    return dict(
+        l1_thickness_um=onset["onset_um"],
+        steepest_rise_um=onset["steepest_rise_um"],
+        n_gfp=onset["n_cells"],
+        gfp_cutoff_linear=float(gfp_meta.get("cutoff_linear", float("nan"))),
+    )
+
+
 def _poly_basis(xn, yn, degree):
     """Design matrix columns for bivariate polynomial up to ``degree``."""
     cols = [np.ones_like(xn)]
