@@ -214,8 +214,11 @@ def _fit_inverse_tps(inp, df):
             rng = np.random.RandomState(0)
             keep[rng.choice(rest, size=min(n_extra, rest.size), replace=False)] = True
         src, dst = src[keep], dst[keep]
-        print(f"[build_qc]   TPS anchors capped {n_full} -> {len(src)} "
-              f"({len(hull_v)} hull vertices kept; MFISH_QC_TPS_MAX_ANCHORS)", flush=True)
+        print(
+            f"[build_qc]   TPS anchors capped {n_full} -> {len(src)} "
+            f"({len(hull_v)} hull vertices kept; MFISH_QC_TPS_MAX_ANCHORS={MFISH_QC_TPS_MAX_ANCHORS})",
+            flush=True,
+        )
     rbf = [
         Rbf(dst[:, 0], dst[:, 1], dst[:, 2], src[:, a], function="thin_plate")
         for a in range(3)
