@@ -177,6 +177,8 @@ def _fit_inverse_tps(inp, df):
         Rbf(dst[:, 0], dst[:, 1], dst[:, 2], src[:, a], function="thin_plate")
         for a in range(3)
     ]
+    if os.environ.get("MFISH_TPS_BOUND", "1") == "0":
+        return rbf, None, None, len(src)
     # Bounded extrapolation (same fix as the matcher's forward TPS, tps.py): the
     # inverse thin-plate warp is trustworthy only INSIDE the HCR-anchor hull; the
     # deep-edge corner of the output grid lies OUTSIDE it, where the unbounded
