@@ -304,8 +304,9 @@ def compute_locked_prior_warm_start(
     # does not hold for dense pan-neuronal stacks) — both call sites hit
     # the same on-disk cache, so the tilt/pia used here for R_tilt / the
     # t_z pia anchor exactly matches the one used at registration time.
+    panneuronal = bool(registration.get("panneuronal", _config.is_panneuronal(sid)))
     cz_surface = (
-        get_cz_pia_surface_panneuronal(s) if _config.is_panneuronal(sid)
+        get_cz_pia_surface_panneuronal(s) if panneuronal
         else get_cz_surface_iter08(s)
     )
     hcr_surface = get_hcr_top_surface_iter07(s)
