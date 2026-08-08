@@ -31,6 +31,7 @@ import pandas as pd
 import tifffile
 from scipy.interpolate import Rbf
 from scipy.ndimage import map_coordinates
+from scipy.spatial import ConvexHull
 
 from autocoreg import config as _config
 from autocoreg.io.cz_volume import load_cz_volume
@@ -53,15 +54,31 @@ def _warp_zslice_chunk(k_range):
     z_lo, vox = c["z_lo"], c["vox"]
     cz_z_um, cz_xy_um = c["cz_z_um"], c["cz_xy_um"]
     cz_seg, cz_vol, ny, nx = c["cz_seg"], c["cz_vol"], c["ny"], c["nx"]
+    inv_affine = c.get("inv_affine"); inv_hull = c.get("inv_hull")
+    tau = c.get("tau", 40.0); margin = c.get("margin", 0.0)
     ks = list(k_range)
     cz_block = np.zeros((len(ks), ny, nx), dtype=np.int32)
     img_block = np.zeros((len(ks), ny, nx), dtype=np.float32)
     for idx, k in enumerate(ks):
         z = z_lo + (k + 0.5) * vox
         Z_flat = np.full_like(Y_flat, z)
-        cz_z_vox = rbf[0](Z_flat, Y_flat, X_flat) / cz_z_um
-        cz_y_vox = rbf[1](Z_flat, Y_flat, X_flat) / cz_xy_um
-        cz_x_vox = rbf[2](Z_flat, Y_flat, X_flat) / cz_xy_um
+        # thin-plate prediction (CZ µm)
+        cz_z_um_p = rbf[0](Z_flat, Y_flat, X_flat)
+        cz_y_um_p = rbf[1](Z_flat, Y_flat, X_flat)
+        cz_x_um_p = rbf[2](Z_flat, Y_flat, X_flat)
+        if inv_affine is not None and inv_hull is not None:
+            # blend to bounded affine OUTSIDE the HCR-anchor hull (w=1 inside).
+            P = np.column_stack([Z_flat, Y_flat, X_flat, np.ones_like(Z_flat)])
+            aff = P @ inv_affine                      # (N,3) CZ µm
+            sd = (np.column_stack([Z_flat, Y_flat, X_flat]) @ inv_hull[:, :3].T
+                  + inv_hull[:, 3]).max(axis=1)        # >0 outside hull
+            w = np.exp(-(np.clip(sd + margin, 0.0, None) / tau) ** 2)
+            cz_z_um_p = w * cz_z_um_p + (1 - w) * aff[:, 0]
+            cz_y_um_p = w * cz_y_um_p + (1 - w) * aff[:, 1]
+            cz_x_um_p = w * cz_x_um_p + (1 - w) * aff[:, 2]
+        cz_z_vox = cz_z_um_p / cz_z_um
+        cz_y_vox = cz_y_um_p / cz_xy_um
+        cz_x_vox = cz_x_um_p / cz_xy_um
         coords = np.stack([cz_z_vox, cz_y_vox, cz_x_vox])
         cz_block[idx] = map_coordinates(
             cz_seg, coords, order=0, mode="constant", cval=0).reshape(ny, nx)
@@ -154,13 +171,31 @@ def _fit_inverse_tps(inp, df):
         raise ValueError(
             f"only {len(src_pts)} usable anchors in matches CSV — need >= 4 for TPS"
         )
-    src = np.asarray(src_pts, dtype=float)
-    dst = np.asarray(dst_pts, dtype=float)
+    src = np.asarray(src_pts, dtype=float)   # CZ µm
+    dst = np.asarray(dst_pts, dtype=float)   # HCR µm (the query frame)
     rbf = [
         Rbf(dst[:, 0], dst[:, 1], dst[:, 2], src[:, a], function="thin_plate")
         for a in range(3)
     ]
-    return rbf, len(src)
+    if os.environ.get("MFISH_TPS_BOUND", "1") == "0":
+        return rbf, None, None, len(src)
+    # Bounded extrapolation (same fix as the matcher's forward TPS, tps.py): the
+    # inverse thin-plate warp is trustworthy only INSIDE the HCR-anchor hull; the
+    # deep-edge corner of the output grid lies OUTSIDE it, where the unbounded
+    # r^2·log(r) kernel smears the sampled CZ image (the visible over-warp
+    # streak). Fit a robust global affine HCR→CZ and the HCR-anchor hull so the
+    # warp blends to the bounded affine outside the hull. w=1 strictly inside →
+    # the sampled image is BIT-IDENTICAL to the pure-TPS render there.
+    from autocoreg.finetune_soma_print.tps import fit_robust_affine
+    try:
+        inv_affine = fit_robust_affine(dst, src)   # HCR µm → CZ µm (4×3)
+    except Exception:
+        inv_affine = None
+    try:
+        inv_hull = ConvexHull(dst).equations         # hull of HCR anchor points
+    except Exception:
+        inv_hull = None
+    return rbf, inv_affine, inv_hull, len(src)
 
 
 def build_qc_artifacts(
@@ -209,9 +244,10 @@ def build_qc_artifacts(
     nx = int(np.ceil((x_hi - x_lo) / vox))
     print(f"[build_qc]   output grid ({nz},{ny},{nx}) @ {vox}µm", flush=True)
 
-    # ----- inverse TPS (HCR µm -> CZ-native µm) -----
-    rbf, n_anchors = _fit_inverse_tps(inp, df)
+    # ----- inverse TPS (HCR µm -> CZ-native µm), bounded-extrapolation -----
+    rbf, inv_affine, inv_hull, n_anchors = _fit_inverse_tps(inp, df)
     print(f"[build_qc]   inverse TPS fit on {n_anchors} anchors "
+          f"(bounded-extrap: {'on' if inv_hull is not None else 'off'}) "
           f"[{time.time()-t0:.1f}s]", flush=True)
 
     # ----- load CZ seg (labels) + CZ 488 image (both CZ-native ZYX) -----
@@ -232,10 +268,13 @@ def build_qc_artifacts(
     Y, X = np.meshgrid(y_centers, x_centers, indexing="ij")
     Y_flat, X_flat = Y.ravel(), X.ravel()
     t = time.time()
+    from autocoreg.finetune_soma_print.tps import TPS_EXTRAP_TAU_UM, TPS_EXTRAP_MARGIN_UM
     _WARP_CTX.update(dict(
         rbf=rbf, Y_flat=Y_flat, X_flat=X_flat, z_lo=z_lo, vox=vox,
         cz_z_um=cz_z_um, cz_xy_um=cz_xy_um, cz_seg=cz_seg, cz_vol=cz_vol,
-        ny=ny, nx=nx))
+        ny=ny, nx=nx,
+        inv_affine=inv_affine, inv_hull=inv_hull,
+        tau=TPS_EXTRAP_TAU_UM, margin=TPS_EXTRAP_MARGIN_UM))
     n_workers = int(os.environ.get(
         "MFISH_QC_WARP_WORKERS", max(1, (os.cpu_count() or 2) - 2)))
     n_workers = max(1, min(n_workers, nz))
