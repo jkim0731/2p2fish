@@ -46,8 +46,8 @@ DEFAULT_VOXEL_UM = float(os.environ.get("MFISH_QC_VOXEL_UM", "2.0"))
 # matched pairs) blow up both fit time (~20 min) and peak memory (an OOM here can dump a core
 # that fills the tiny root overlay and locks the env). Above this cap we subsample anchors but
 # ALWAYS keep the convex-hull vertices, so the bounded-extrapolation hull is exact and the field
-# stays faithful. 0 disables the cap. Subjects with <= this many anchors are UNTOUCHED
-# (bit-identical) — including every GT benchmark subject.
+# stays faithful. 0 disables the cap. Subjects with <= this many anchors are not subsampled, so
+# the fitted RBF / inv_affine / inv_hull are unchanged (including every GT benchmark subject).
 MFISH_QC_TPS_MAX_ANCHORS = int(os.environ.get("MFISH_QC_TPS_MAX_ANCHORS", "3000"))
 
 # Shared read-only context for the parallel inverse-TPS warp (fork-inherited).
