@@ -34,8 +34,8 @@ TPS_EXTRAP_TAU_UM = 40.0     # blend decay length (um) once past the grace zone
 TPS_EXTRAP_MARGIN_UM = -50.0
 
 
-def _fit_robust_affine(src_zyx: np.ndarray, dst_zyx: np.ndarray,
-                       n_iter: int = 2) -> np.ndarray:
+def fit_robust_affine(src_zyx: np.ndarray, dst_zyx: np.ndarray,
+                      n_iter: int = 2) -> np.ndarray:
     """Robust affine A (4x3, row-vec: dst ~= [src,1] @ A) via IRLS, so the
     ~majority of correct anchors dominate and a small coherent bad block barely
     moves it. Same robust-linear pattern used elsewhere in the pipeline."""
@@ -66,7 +66,7 @@ def fit_tps(src_zyx: np.ndarray, dst_zyx: np.ndarray) -> dict | None:
     except Exception:
         return None
     try:
-        affine = _fit_robust_affine(src_zyx, dst_zyx)
+        affine = fit_robust_affine(src_zyx, dst_zyx)
     except Exception:
         affine = None
     try:

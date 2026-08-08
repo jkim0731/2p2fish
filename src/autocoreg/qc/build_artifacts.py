@@ -220,6 +220,8 @@ def _fit_inverse_tps(inp, df):
         Rbf(dst[:, 0], dst[:, 1], dst[:, 2], src[:, a], function="thin_plate")
         for a in range(3)
     ]
+    if os.environ.get("MFISH_TPS_BOUND", "1") == "0":
+        return rbf, None, None, len(src)
     # Bounded extrapolation (same fix as the matcher's forward TPS, tps.py): the
     # inverse thin-plate warp is trustworthy only INSIDE the HCR-anchor hull; the
     # deep-edge corner of the output grid lies OUTSIDE it, where the unbounded
@@ -227,9 +229,9 @@ def _fit_inverse_tps(inp, df):
     # streak). Fit a robust global affine HCR→CZ and the HCR-anchor hull so the
     # warp blends to the bounded affine outside the hull. w=1 strictly inside →
     # the sampled image is BIT-IDENTICAL to the pure-TPS render there.
-    from autocoreg.finetune_soma_print.tps import _fit_robust_affine
+    from autocoreg.finetune_soma_print.tps import fit_robust_affine
     try:
-        inv_affine = _fit_robust_affine(dst, src)   # HCR µm → CZ µm (4×3)
+        inv_affine = fit_robust_affine(dst, src)   # HCR µm → CZ µm (4×3)
     except Exception:
         inv_affine = None
     try:
