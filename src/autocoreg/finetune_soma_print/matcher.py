@@ -93,6 +93,9 @@ LOCAL_FLOW_QUANTILE = 0.90
 # (interpolated) support region — e.g. the deepest CZ slab whose true HCR
 # partner is beyond the overlap — can never anchor the TPS and lock in a fold.
 # Keyed off the PREVIOUS round's accepted set, so it is non-circular (last
+# round's clean hull never contains a freshly-dragged orphan). The generous
+# margin (= R_CAND_UM) means on densely-covered pools every match is well inside
+# the hull and 0 pairs are rejected — so it is inert on the sparse benchmark.
 SUPPORT_HULL_MARGIN_UM = R_CAND_UM
 # Primary gate: LR
 LIKELIHOOD_RATIO_THRESHOLD = 0.05
