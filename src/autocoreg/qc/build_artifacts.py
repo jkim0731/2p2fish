@@ -184,9 +184,9 @@ def _fit_inverse_tps(inp, df):
     # streak). Fit a robust global affine HCR→CZ and the HCR-anchor hull so the
     # warp blends to the bounded affine outside the hull. w=1 strictly inside →
     # the sampled image is BIT-IDENTICAL to the pure-TPS render there.
-    from autocoreg.finetune_soma_print.tps import _fit_robust_affine
+    from autocoreg.finetune_soma_print.tps import fit_robust_affine
     try:
-        inv_affine = _fit_robust_affine(dst, src)   # HCR µm → CZ µm (4×3)
+        inv_affine = fit_robust_affine(dst, src)   # HCR µm → CZ µm (4×3)
     except Exception:
         inv_affine = None
     try:
