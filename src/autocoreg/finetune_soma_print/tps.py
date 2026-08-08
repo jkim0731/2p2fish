@@ -78,9 +78,6 @@ def fit_tps(src_zyx: np.ndarray, dst_zyx: np.ndarray) -> dict | None:
                 tau=TPS_EXTRAP_TAU_UM, margin=TPS_EXTRAP_MARGIN_UM)
 
 
-_fit_robust_affine = fit_robust_affine
-
-
 def apply_tps(tps: dict, pts_zyx: np.ndarray) -> np.ndarray:
     pts = np.asarray(pts_zyx, dtype=float)
     tps_pred = np.column_stack([
