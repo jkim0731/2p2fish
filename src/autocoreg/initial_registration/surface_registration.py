@@ -68,6 +68,8 @@ from autocoreg.initial_registration.register_2d import cz_binary_top_mip, hcr488
 from autocoreg.initial_registration.register_nonrigid import nonrigid_piecewise_rigid
 
 from autocoreg.initial_registration.surfaces import get_cz_surface_iter08, get_hcr_top_surface_iter07
+from autocoreg.initial_registration.cz_surface import get_cz_pia_surface_panneuronal
+from autocoreg.initial_registration.surface_detect import compute_hcr_gfp_l1_thickness_panneuronal
 
 from autocoreg import config as _config
 CACHE_DIR = _config.SURFACE_REGISTRATION_CACHE_DIR
@@ -90,6 +92,22 @@ PWR_MAX_SHIFT_PX = 16
 PWR_SMOOTH_SIGMA_PX = 8.0
 CROP_MARGIN_FRAC = 0.15
 WARP_BIN_THR = 0.5
+
+# --------------------------------------------------------------
+# Pan-neuronal (session 22/24; e.g. 837568) protocol constants
+# --------------------------------------------------------------
+# Benchmark structural CZ-vs-HCR mounting prior baked into the warm start
+# (see register_2d.warm_start_cz_binary). Named here (rather than imported
+# from locked_prior.py, to avoid a dependency the wrong way round) because
+# it is what compute_surface_registration bakes into cz_bin_warm by
+# default; pan-neuronal subjects use 0.0 instead (no rotation prior).
+ROT_DEG_WARM_BENCHMARK = 180.0
+ROT_DEG_WARM_PANNEURONAL = 0.0
+# Fallback sxy for a pan-neuronal subject if estimate_sxy_min_rule raises —
+# its "2x zstack thickness" heuristic is tuned on sparse-GCaMP depth
+# statistics and may not hold for dense pan-neuronal stacks. Value is
+# subject 837568-01's coreg_manifest sxy (session 24 register_l1_protocol.py).
+PANNEURONAL_SXY_FALLBACK = 1.7324870819305511
 
 METHOD_KEYS = ("rigid", "affine", "pwr3x3", "pwr4x4")
 METHOD_LABELS = {
@@ -156,6 +174,7 @@ def compute_surface_registration(
     cz_surface: dict | None = None,
     sxy: float | None = None,
     sxy_source: str = "",
+    panneuronal: bool | None = None,
     return_warps: bool = False,
     verbose: bool = False,
 ) -> dict:
@@ -169,7 +188,8 @@ def compute_surface_registration(
         ``SubjectData`` from ``benchmark_data_loader.load_subject``.
     hcr_top_surface, cz_surface
         Optional pre-fit surfaces.  Defaults call
-        :func:`get_hcr_top_surface_iter07` / :func:`get_cz_surface_iter08`.
+        :func:`get_hcr_top_surface_iter07` / :func:`get_cz_surface_iter08`
+        (or, when ``panneuronal``, :func:`get_cz_pia_surface_panneuronal`).
     sxy
         Anisotropy scale (CZ-µm → HCR-µm).  When ``None``,
         :func:`roi_area_sxy.estimate_sxy_min_rule` is called (PRODUCTION,
@@ -181,6 +201,15 @@ def compute_surface_registration(
         back to GT.
     sxy_source
         Provenance label propagated into the result dict.
+    panneuronal
+        If ``None`` (default), resolved via ``autocoreg.config.is_panneuronal``
+        (env ``MFISH_PANNEURONAL_SIDS``). When True, uses the pan-neuronal
+        path (session 22/24; e.g. subject 837568): cell-density onset CZ
+        pia surface, per-side L1-thickness slab bands instead of the fixed
+        80/150 µm benchmark bands, the raw (non-watershed) 488 MIP as the
+        stage-1 rigid bootstrap target, no warm-start pre-rotation, and a
+        full 360° stage-1 rotation search. Every other subject (default
+        path) is byte-for-byte unchanged.
     return_warps
         If True, include the rendered warped-CZ arrays for every
         method.  Defaults to False to keep memory bounded.
@@ -192,10 +221,57 @@ def compute_surface_registration(
         crop bbox, and the rigid-bootstrap target metadata.
     """
     sid = s.subject_id
+    if panneuronal is None:
+        panneuronal = _config.is_panneuronal(sid)
+
     if hcr_top_surface is None:
         hcr_top_surface = get_hcr_top_surface_iter07(s, level=HCR_LEVEL)
-    if cz_surface is None:
-        cz_surface = get_cz_surface_iter08(s)
+
+    if panneuronal:
+        # ---- Pan-neuronal path (session 22/24) ----
+        # Dense/GCaMP-pan-neuronal CZ stacks break both the sparse-cell
+        # iter08 CZ surface and the ±30° warm-started rigid search (both
+        # assume a sparse cell cloud and a ~180° CZ-vs-HCR mounting prior
+        # that do not hold here). Use the cell-density onset CZ pia
+        # surface, size each side's slab to its own L1 thickness (not the
+        # fixed benchmark 80/150 µm), register on the raw ch488 MIP
+        # (skip the watershed bootstrap), warm-start with no pre-rotation,
+        # and let stage1_rigid search the full circle for the true
+        # rotation (session 24: ~277° for 837568).
+        if cz_surface is None:
+            cz_surface = get_cz_pia_surface_panneuronal(s)
+        if cz_surface is None:
+            raise RuntimeError(
+                f"{sid}: pan-neuronal CZ onset-surface computation failed "
+                "(too few CZ centroids?)"
+            )
+        cz_l1_thickness_um = float(cz_surface["l1_thickness_um"])
+
+        hcr_l1_info = compute_hcr_gfp_l1_thickness_panneuronal(
+            s, hcr_top_surface=hcr_top_surface)
+        if hcr_l1_info is None:
+            raise RuntimeError(
+                f"{sid}: pan-neuronal HCR GFP+ L1/L2-onset computation "
+                "failed (too few GFP+ cells / missing pia surface?)"
+            )
+        hcr_l1_thickness_um = float(hcr_l1_info["l1_thickness_um"])
+
+        cz_slab = (0.0, cz_l1_thickness_um)
+        hcr_slab = (0.0, hcr_l1_thickness_um)
+        rot_deg_warm = ROT_DEG_WARM_PANNEURONAL
+        stage1_full_search = True
+        use_watershed_bootstrap = False
+    else:
+        if cz_surface is None:
+            cz_surface = get_cz_surface_iter08(s)
+        cz_l1_thickness_um = None
+        hcr_l1_thickness_um = None
+        cz_slab = CZ_SLAB
+        hcr_slab = HCR_SLAB
+        rot_deg_warm = ROT_DEG_WARM_BENCHMARK
+        stage1_full_search = False
+        use_watershed_bootstrap = True
+
     if sxy is None:
         # PRODUCTION base sxy (PROMOTED 2026-06-04): min-rule, 2× heuristic, ¼-FOV.
         # GT-free. Rule (see roi_area_sxy.estimate_sxy_min_rule for the full
@@ -212,23 +288,39 @@ def compute_surface_registration(
         # and pick the pose that lands (highest soma-print mutual-best / lowest
         # rigid off-centre). GT-free.
         from autocoreg.initial_registration.lateral_scale import estimate_sxy_min_rule
-        sxy = float(estimate_sxy_min_rule(sid)["sxy_median"])
-        sxy_source = sxy_source or "min_rule_2x_quarterfov"
+        if panneuronal:
+            # The min-rule's "2x zstack thickness" heuristic is tuned on
+            # sparse-GCaMP depth statistics; fall back to the coreg_manifest
+            # value (session 24) if it raises on a dense pan-neuronal stack.
+            try:
+                sxy = float(estimate_sxy_min_rule(sid)["sxy_median"])
+                sxy_source = sxy_source or "min_rule_2x_quarterfov"
+            except Exception as exc:
+                sxy = PANNEURONAL_SXY_FALLBACK
+                sxy_source = sxy_source or f"panneuronal_fallback_constant:{type(exc).__name__}"
+        else:
+            sxy = float(estimate_sxy_min_rule(sid)["sxy_median"])
+            sxy_source = sxy_source or "min_rule_2x_quarterfov"
 
     # Targets: raw 488 MIP for *comparison*, watershed binary for
-    # *rigid bootstrap* (more robust when initial overlap is small).
+    # *rigid bootstrap* (more robust when initial overlap is small) —
+    # pan-neuronal skips the watershed step and bootstraps on the raw MIP.
     raw488_full, hcr_xy_um = hcr488_top_mip(
-        s, hcr_top_surface, *HCR_SLAB)
+        s, hcr_top_surface, *hcr_slab)
     raw488_full = np.nan_to_num(raw488_full.astype(np.float32), nan=0.0)
-    rigid_target = variant_watershed(raw488_full, hcr_xy_um)
+    rigid_target = (
+        variant_watershed(raw488_full, hcr_xy_um) if use_watershed_bootstrap
+        else raw488_full
+    )
 
-    cz_bin = cz_binary_top_mip(s, cz_surface, *CZ_SLAB)
+    cz_bin = cz_binary_top_mip(s, cz_surface, *cz_slab)
     cz_bin_warm = warm_start_cz_binary(
         cz_bin, cz_xy_um=float(s.cz_xy_um), hcr_xy_um=hcr_xy_um, sxy=sxy,
+        rot_deg=rot_deg_warm,
     )
 
     # ---------- Stage 1: rigid (binary bootstrap target) -----------
-    rigid = stage1_rigid(cz_bin_warm, rigid_target)
+    rigid = stage1_rigid(cz_bin_warm, rigid_target, full_search=stage1_full_search)
     M0, off0 = _rigid_to_M_off(
         rigid, template_shape=cz_bin_warm.shape,
         template_shape_rot=rigid["template_shape"],
@@ -336,16 +428,25 @@ def compute_surface_registration(
         cz_xy_um=float(s.cz_xy_um),
         cz_z_um=float(s.cz_z_um),
         hcr_z_um=float(s.hcr_z_um),
-        cz_slab_um=list(CZ_SLAB),
-        hcr_slab_um=list(HCR_SLAB),
+        # NOTE: previously hardcoded to the module constants CZ_SLAB/
+        # HCR_SLAB; now the slab actually used (== the constants when
+        # panneuronal is False, so the benchmark path is unaffected).
+        cz_slab_um=list(cz_slab),
+        hcr_slab_um=list(hcr_slab),
         hcr_full_shape=list(raw488_full.shape),
         crop_bbox=[int(y0), int(y1), int(x0), int(x1)],
         crop_shape=list(hcr_crop.shape),
+        cz_bin_shape=list(cz_bin.shape),
         cz_warm_shape=list(cz_bin_warm.shape),
+        rot_deg_warm=float(rot_deg_warm),
         warp_bin_thr=float(WARP_BIN_THR),
         scale_bounds=list(SCALE_BOUNDS),
         theta_bound_deg=float(THETA_BOUND_DEG),
         crop_margin_frac=float(CROP_MARGIN_FRAC),
+        panneuronal=bool(panneuronal),
+        cz_l1_thickness_um=cz_l1_thickness_um,
+        hcr_l1_thickness_um=hcr_l1_thickness_um,
+        stage1_target=("raw488" if not use_watershed_bootstrap else "watershed_binary"),
         methods=methods,
     )
     if return_warps:
@@ -374,21 +475,38 @@ def apply_registration(
     ``reg['best_method']``.  Returns
     ``{"warped": ..., "hcr_target_crop": ..., "method": ...}`` —
     suitable for plotting or downstream metric checks.
+
+    Reads the slab bands + warm-start rotation actually used to build
+    ``reg`` (``reg["cz_slab_um"]`` / ``["hcr_slab_um"]`` / ["rot_deg_warm"])
+    rather than assuming the fixed benchmark constants, so a pan-neuronal
+    registration (different slabs, 0° warm-start) re-renders correctly.
+    Falls back to the benchmark constants/180° for registrations cached
+    before these fields existed (all pre-existing benchmark caches, where
+    the fallback values equal what was actually used).
     """
+    panneuronal = bool(reg.get("panneuronal", False))
     if cz_surface is None:
-        cz_surface = get_cz_surface_iter08(s)
+        cz_surface = (
+            get_cz_pia_surface_panneuronal(s) if panneuronal
+            else get_cz_surface_iter08(s)
+        )
     method = method or reg["best_method"]
 
+    hcr_slab = tuple(reg.get("hcr_slab_um", HCR_SLAB))
+    cz_slab = tuple(reg.get("cz_slab_um", CZ_SLAB))
+    rot_deg_warm = float(reg.get("rot_deg_warm", ROT_DEG_WARM_BENCHMARK))
+
     raw488_full, _ = hcr488_top_mip(s, get_hcr_top_surface_iter07(s, level=HCR_LEVEL),
-                                    *HCR_SLAB)
+                                    *hcr_slab)
     raw488_full = np.nan_to_num(raw488_full.astype(np.float32), nan=0.0)
     y0, y1, x0, x1 = reg["crop_bbox"]
     hcr_crop = raw488_full[y0:y1, x0:x1].astype(np.float32)
 
-    cz_bin = cz_binary_top_mip(s, cz_surface, *CZ_SLAB)
+    cz_bin = cz_binary_top_mip(s, cz_surface, *cz_slab)
     cz_bin_warm = warm_start_cz_binary(
         cz_bin, cz_xy_um=float(s.cz_xy_um),
         hcr_xy_um=float(reg["hcr_xy_um"]), sxy=float(reg["sxy"]),
+        rot_deg=rot_deg_warm,
     )
 
     if method in ("rigid", "affine"):

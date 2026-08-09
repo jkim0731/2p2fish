@@ -41,8 +41,32 @@ from autocoreg.io.inputs import load_sz_pins, subject_inputs
 # 2.0 µm gives crisp ROI boundaries + CZ image (4.0 was blocky); env-overridable.
 DEFAULT_VOXEL_UM = float(os.environ.get("MFISH_QC_VOXEL_UM", "2.0"))
 
+# Cap on the number of TPS anchors used for the inverse warp. scipy.Rbf is O(N^3) to fit and
+# materializes an (N_query x N_anchor) kernel matrix per evaluation, so dense subjects (~8k
+# matched pairs) blow up both fit time (~20 min) and peak memory (an OOM here can dump a core
+# that fills the tiny root overlay and locks the env). Above this cap we subsample anchors but
+# ALWAYS keep the convex-hull vertices, so the bounded-extrapolation hull is exact and the field
+# stays faithful. 0 disables the cap. Subjects with <= this many anchors are not subsampled, so
+# the fitted RBF / inv_affine / inv_hull are unchanged (including every GT benchmark subject).
+MFISH_QC_TPS_MAX_ANCHORS = int(os.environ.get("MFISH_QC_TPS_MAX_ANCHORS", "3000"))
+
 # Shared read-only context for the parallel inverse-TPS warp (fork-inherited).
 _WARP_CTX: dict = {}
+
+
+def _rbf_eval_chunked(rbf_axis, Z, Y, X, chunk=250_000):
+    """Evaluate a scipy Rbf in query-point chunks so the full (N_query x N_anchor) kernel matrix
+    never materializes at once (bounds peak memory on dense subjects). Numerically identical to
+    ``rbf_axis(Z, Y, X)`` — each query point is evaluated independently; only BLAS's reduction
+    tiling over the anchor axis shifts the last bits (~1e-11 µm, 11 orders below the voxel)."""
+    n = int(Z.shape[0])
+    if n <= chunk:
+        return rbf_axis(Z, Y, X)
+    out = np.empty(n, dtype=float)
+    for i in range(0, n, chunk):
+        j = min(i + chunk, n)
+        out[i:j] = rbf_axis(Z[i:j], Y[i:j], X[i:j])
+    return out
 
 
 def _warp_zslice_chunk(k_range):
@@ -63,9 +87,9 @@ def _warp_zslice_chunk(k_range):
         z = z_lo + (k + 0.5) * vox
         Z_flat = np.full_like(Y_flat, z)
         # thin-plate prediction (CZ µm)
-        cz_z_um_p = rbf[0](Z_flat, Y_flat, X_flat)
-        cz_y_um_p = rbf[1](Z_flat, Y_flat, X_flat)
-        cz_x_um_p = rbf[2](Z_flat, Y_flat, X_flat)
+        cz_z_um_p = _rbf_eval_chunked(rbf[0], Z_flat, Y_flat, X_flat)
+        cz_y_um_p = _rbf_eval_chunked(rbf[1], Z_flat, Y_flat, X_flat)
+        cz_x_um_p = _rbf_eval_chunked(rbf[2], Z_flat, Y_flat, X_flat)
         if inv_affine is not None and inv_hull is not None:
             # blend to bounded affine OUTSIDE the HCR-anchor hull (w=1 inside).
             P = np.column_stack([Z_flat, Y_flat, X_flat, np.ones_like(Z_flat)])
@@ -173,6 +197,28 @@ def _fit_inverse_tps(inp, df):
         )
     src = np.asarray(src_pts, dtype=float)   # CZ µm
     dst = np.asarray(dst_pts, dtype=float)   # HCR µm (the query frame)
+    # Cap anchors (keeping the convex-hull vertices) so dense subjects don't blow up the Rbf
+    # fit/eval. A subject with <= MFISH_QC_TPS_MAX_ANCHORS pairs skips this entirely, so its
+    # rbf / inv_affine / inv_hull are bit-identical to before. Deterministic (fixed seed).
+    n_full = len(src)
+    if MFISH_QC_TPS_MAX_ANCHORS and n_full > MFISH_QC_TPS_MAX_ANCHORS:
+        try:
+            hull_v = np.unique(ConvexHull(dst).vertices)
+        except Exception:
+            hull_v = np.empty(0, dtype=int)
+        keep = np.zeros(n_full, dtype=bool)
+        keep[hull_v] = True                                  # hull kept -> inv_hull unchanged
+        n_extra = MFISH_QC_TPS_MAX_ANCHORS - int(keep.sum())
+        rest = np.flatnonzero(~keep)
+        if n_extra > 0 and rest.size:
+            rng = np.random.RandomState(0)
+            keep[rng.choice(rest, size=min(n_extra, rest.size), replace=False)] = True
+        src, dst = src[keep], dst[keep]
+        print(
+            f"[build_qc]   TPS anchors capped {n_full} -> {len(src)} "
+            f"({len(hull_v)} hull vertices kept; MFISH_QC_TPS_MAX_ANCHORS={MFISH_QC_TPS_MAX_ANCHORS})",
+            flush=True,
+        )
     rbf = [
         Rbf(dst[:, 0], dst[:, 1], dst[:, 2], src[:, a], function="thin_plate")
         for a in range(3)

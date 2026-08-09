@@ -109,3 +109,29 @@ QC_MATCHES_DIR = Path(
 QC_CACHE_DIR = Path(
     os.environ.get("MFISH_QC_CACHE_DIR", "/scratch/autocoreg_qc_cache")
 )
+
+# ---------------------------------------------------------------------------
+# Pan-neuronal subjects (dense/GCaMP-pan-neuronal CZ stacks)
+# ---------------------------------------------------------------------------
+# Subjects whose CZ stack is pan-neuronally dense (e.g. 837568) rather than
+# sparse-GCaMP. The benchmark's sparse-cell CZ pia detector (iter08) and the
+# +-30 deg warm-started rigid search both assume a sparse cell cloud and a
+# constant ~180 deg CZ-vs-HCR mounting prior; neither holds for pan-neuronal
+# stacks (session 22/24: 837568 needs a cell-density onset surface, and its
+# true CZ<->HCR rotation is ~277 deg, not 180 deg). MFISH_PANNEURONAL_SIDS
+# opts individual subjects into the alternate path; empty by default so the
+# benchmark path is byte-for-byte unchanged.
+PANNEURONAL_SUBJECTS = frozenset(
+    sid.strip()
+    for sid in os.environ.get("MFISH_PANNEURONAL_SIDS", "").split(",")
+    if sid.strip()
+)
+
+
+def is_panneuronal(sid) -> bool:
+    """True if ``sid`` should use the pan-neuronal registration path.
+
+    See ``PANNEURONAL_SUBJECTS`` (env ``MFISH_PANNEURONAL_SIDS``, comma
+    separated, default empty).
+    """
+    return str(sid) in PANNEURONAL_SUBJECTS

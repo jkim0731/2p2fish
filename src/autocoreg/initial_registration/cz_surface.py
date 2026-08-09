@@ -40,11 +40,14 @@ Outputs
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import tifffile
+from scipy.ndimage import gaussian_filter1d
+from scipy.signal import find_peaks
 
 from autocoreg.io.hcr_image import analyze_subject, estimate_pia_surface
 from autocoreg.io.subjects import cz_px_to_um, load_subject
@@ -148,6 +151,203 @@ def fit_gated_surface(xs_um, ys_um, zs_um, target_z=CZ_TARGET_Z_UM,
     polyfit = fit_polysurf(xs_in, ys_in, zs_in,
                            degree=POLY_DEGREE, huber_k=HUBER_K)
     return polyfit, int(in_gate.sum()), int(ok.sum())
+
+
+# ============================================================
+# Pan-neuronal CZ pia surface — cell-density onset rule (session 22/24)
+# ============================================================
+# The iter08 detector above assumes a sparse GCaMP cell cloud with a clean
+# OOT->tissue image cliff. Dense pan-neuronal CZ stacks (e.g. 837568) have
+# neither: the whole FOV is saturated with cell bodies near the top, so a
+# per-column image threshold does not reliably land on the true pia.
+#
+# This alternate detector instead uses the CZ centroid *density* profile:
+# cortical L1 is cell-sparse and L2 begins with a dense band, so (1) the
+# tissue tilt is the plane that maximises the sharpness of that L1->L2
+# density rise, (2) the L1/L2 boundary is the ONSET (foot) of the rise —
+# not its steepest point, which sits mid-L2 — and (3) the pia is a
+# superficial cell-density peak (the first-neuron layer sits ~10 um below
+# the true membrane). Validated on 837568 against the independent
+# dextran-vasculature pia (session 22 notebook, converges to ~1 um) and
+# productionised in `register_l1_protocol.py` (session 24), which uses the
+# resulting surface + L1 thickness to recover the true ~277 deg CZ<->HCR
+# rotation via a full-circle registration search.
+
+# Minimum CZ centroids needed before trusting the density-based tilt/onset
+# search (837568 has ~1e5 cells; this just guards a near-empty stack).
+PANNEURONAL_CZ_MIN_CELLS = 500
+
+# Tissue-tilt search grid: z = a*x + b*y maximising the L1/L2 density-rise
+# sharpness (session 22 sec. 2).
+PANNEURONAL_TILT_GRID = np.arange(-0.25, 0.251, 0.03)
+
+# Depth-histogram bin width / smoothing used by the tilt search + L1/L2
+# onset detector.
+PANNEURONAL_DENS_BIN_UM = 4.0
+PANNEURONAL_DENS_SIGMA_BINS = 1.2
+
+# Tissue onset (foot of the very first density rise — where cells start
+# appearing at all) = first depth bin whose density exceeds this fraction
+# of the L2+ plateau (8%: avoids sparse-L1 fluctuation without landing
+# mid-tissue; plateau = median density beyond this percentile of depths).
+PANNEURONAL_PLATEAU_PERCENTILE = 55.0
+PANNEURONAL_TISSUE_ONSET_PLATEAU_FRAC = 0.08
+
+# L1/L2 steepest-rise search zone, in um below the tissue onset — excludes
+# the pia/superficial band and the deep L2+ plateau.
+PANNEURONAL_L1L2_SEARCH_LO_UM = 45.0
+PANNEURONAL_L1L2_SEARCH_HI_UM = 260.0
+
+# L1/L2 boundary = ONSET (foot) of the rise: starting from the steepest-
+# rise point, walk shallower until the gradient first drops below this
+# fraction of its peak.
+PANNEURONAL_L1L2_GRADIENT_FRAC = 0.25
+
+# Superficial cell-peak finder: finer histogram than the tilt search, plus
+# a peak-prominence floor (session 22 sec. 6, `scipy.signal.find_peaks`).
+PANNEURONAL_PEAK_BIN_UM = 2.0
+PANNEURONAL_PEAK_SIGMA_BINS = 1.0
+PANNEURONAL_PEAK_PROMINENCE = 0.5
+# Candidate peaks are restricted to [tissue_onset - LO, steepest_rise - HI]
+# so the pia peak wins over autofluorescence debris or the L2 rise itself.
+PANNEURONAL_PEAK_SEARCH_LO_MARGIN_UM = 3.0
+PANNEURONAL_PEAK_SEARCH_HI_MARGIN_UM = 25.0
+
+# Pia sits this far above the superficial cell peak — the peak is the
+# first-neuron layer, ~10 um below the true membrane (calibrated against
+# the independent dextran-vasculature pia on 837568, session 22 sec. 6).
+PANNEURONAL_PIA_ABOVE_PEAK_UM = 10.0
+
+
+def _panneuronal_density_profile(z, y, x, a, b, bin_um, sigma_bins):
+    """Smoothed depth histogram of centroids after detrending the tilt
+    plane ``z = a*x + b*y``. Returns ``(depth, bin_centers, density)``."""
+    depth = z - (a * x + b * y)
+    edges = np.arange(depth.min(), depth.max() + bin_um, bin_um)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    density = gaussian_filter1d(
+        np.histogram(depth, bins=edges)[0].astype(float), sigma_bins)
+    return depth, centers, density
+
+
+def _panneuronal_l1l2_onset(z, y, x, a, b):
+    """Tissue onset, L1/L2 onset (foot of the density rise), the rise's
+    sharpness, and the steepest-rise reference depth, for tilt plane
+    ``(a, b)``. Returns
+    ``(tissue_onset_um, l1l2_onset_um, sharpness, steepest_rise_um)``."""
+    depth, centers, density = _panneuronal_density_profile(
+        z, y, x, a, b, PANNEURONAL_DENS_BIN_UM, PANNEURONAL_DENS_SIGMA_BINS)
+    gradient = np.gradient(density)
+    plateau = np.median(
+        density[centers > np.percentile(depth, PANNEURONAL_PLATEAU_PERCENTILE)])
+    tissue_onset = float(centers[np.argmax(
+        density > PANNEURONAL_TISSUE_ONSET_PLATEAU_FRAC * plateau)])
+    zone = np.where(
+        (centers > tissue_onset + PANNEURONAL_L1L2_SEARCH_LO_UM)
+        & (centers < tissue_onset + PANNEURONAL_L1L2_SEARCH_HI_UM))[0]
+    if zone.size == 0:
+        # No rise found in the search zone at this tilt — report zero
+        # sharpness so the tilt grid search skips it, but still return
+        # finite depths.
+        return tissue_onset, tissue_onset, 0.0, tissue_onset
+    gi = zone[int(np.argmax(gradient[zone]))]
+    thr = PANNEURONAL_L1L2_GRADIENT_FRAC * gradient[gi]
+    i = gi
+    while i - 1 >= zone[0] and gradient[i - 1] >= thr:
+        i -= 1
+    return tissue_onset, float(centers[i]), float(gradient[gi]), float(centers[gi])
+
+
+def compute_cz_pia_surface_panneuronal(s) -> dict | None:
+    """Onset-rule CZ pia surface + L1 thickness for pan-neuronal (dense)
+    CZ stacks (session 22/24; e.g. subject 837568).
+
+    Reuses the existing CZ centroid loader (``cz_px_to_um``). Returns the
+    canonical planar ``{a, b, c, p, q, r}`` surface dict (``p=q=r=0``, so
+    it plugs directly into ``depth_from_surface`` / ``top_slab_projection``
+    like every other surface in this package) plus ``l1_thickness_um`` and
+    detection diagnostics — or ``None`` if there are too few CZ centroids.
+
+    Algorithm (session 22 secs. 2 + 6; productionised in
+    ``register_l1_protocol.py``, session 24):
+      1. Grid-search the tissue tilt ``(a, b)`` in ``z = a*x + b*y``
+         maximising the L1/L2 density-rise sharpness.
+      2. L1/L2 boundary = ONSET (foot) of the L1->L2 density rise at that
+         tilt (not the steepest point, which sits mid-L2).
+      3. Superficial cell-density peak (``find_peaks``) between the
+         tissue onset and the L1/L2 steepest-rise reference.
+      4. Pia = superficial peak - ``PANNEURONAL_PIA_ABOVE_PEAK_UM``; falls
+         back to the tissue onset if no peak is found (mirrors
+         ``register_l1_protocol.py``).
+    """
+    cz_um = cz_px_to_um(
+        s.cz_centroids[["z_px", "y_px", "x_px"]].to_numpy(float), s)
+    if len(cz_um) < PANNEURONAL_CZ_MIN_CELLS:
+        return None
+    z, y, x = cz_um[:, 0], cz_um[:, 1], cz_um[:, 2]
+
+    best_sharpness, tilt_a, tilt_b = -np.inf, 0.0, 0.0
+    for a in PANNEURONAL_TILT_GRID:
+        for b in PANNEURONAL_TILT_GRID:
+            sharpness = _panneuronal_l1l2_onset(z, y, x, a, b)[2]
+            if sharpness > best_sharpness:
+                best_sharpness, tilt_a, tilt_b = sharpness, float(a), float(b)
+
+    tissue_onset, l1l2_onset, sharpness, steepest_rise = (
+        _panneuronal_l1l2_onset(z, y, x, tilt_a, tilt_b))
+
+    _, centers, density = _panneuronal_density_profile(
+        z, y, x, tilt_a, tilt_b,
+        PANNEURONAL_PEAK_BIN_UM, PANNEURONAL_PEAK_SIGMA_BINS)
+    peaks, props = find_peaks(density, prominence=PANNEURONAL_PEAK_PROMINENCE)
+    peak_zone = (
+        (centers[peaks] > tissue_onset - PANNEURONAL_PEAK_SEARCH_LO_MARGIN_UM)
+        & (centers[peaks] < steepest_rise - PANNEURONAL_PEAK_SEARCH_HI_MARGIN_UM))
+    if peak_zone.any():
+        k = int(np.argmax(props["prominences"][peak_zone]))
+        superficial_peak = float(centers[peaks[peak_zone][k]])
+        pia = superficial_peak - PANNEURONAL_PIA_ABOVE_PEAK_UM
+    else:
+        superficial_peak = None
+        pia = tissue_onset
+
+    return dict(
+        a=float(tilt_a), b=float(tilt_b), c=float(pia), p=0.0, q=0.0, r=0.0,
+        l1_thickness_um=float(l1l2_onset - pia),
+        method="panneuronal_cell_density_onset",
+        subject_id=str(s.subject_id),
+        n_cz_cells=int(len(cz_um)),
+        tissue_onset_um=float(tissue_onset),
+        l1l2_onset_um=float(l1l2_onset),
+        l1l2_steepest_rise_um=float(steepest_rise),
+        l1l2_sharpness=float(sharpness),
+        superficial_peak_um=superficial_peak,
+    )
+
+
+def get_cz_pia_surface_panneuronal(
+    s, *, use_cache: bool = True, write_cache: bool = True,
+) -> dict | None:
+    """Cache-aware accessor for ``compute_cz_pia_surface_panneuronal``.
+
+    Cached alongside the other promoted surfaces
+    (``autocoreg.config.SURFACES_CACHE_DIR``) under a distinct filename so
+    ``surface_registration.py`` and ``locked_prior.py`` resolve the exact
+    same surface without recomputing it. Kept self-contained here (rather
+    than routed through ``surfaces.py``'s cache helpers) to avoid a module
+    import cycle — ``surfaces.py`` imports helpers FROM this module.
+    """
+    from autocoreg import config as _config
+    cache_path = (
+        _config.SURFACES_CACHE_DIR / f"{s.subject_id}_cz_onset_panneuronal.json"
+    )
+    if use_cache and cache_path.exists():
+        return json.loads(cache_path.read_text())
+    surface = compute_cz_pia_surface_panneuronal(s)
+    if write_cache and surface is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(surface, indent=2))
+    return surface
 
 
 def _cz_existing_surface(s):
