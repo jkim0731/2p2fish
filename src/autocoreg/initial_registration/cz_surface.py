@@ -41,6 +41,7 @@ Outputs
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -325,6 +326,123 @@ def compute_cz_pia_surface_panneuronal(s) -> dict | None:
     )
 
 
+# ── Dextran-plexus leading-edge CZ pia (ALTERNATIVE pan-neuronal pia) ──────────────
+# Pan-neuronal (dense GCaMP) subjects that ALSO acquired a dextran vasculature channel can
+# derive the CZ pia from the dextran-plexus leading edge instead of the cell-density onset.
+# Only the pia/tilt differ; the L1 slab thickness is kept from the density-onset method
+# (session 25). Gated by the env var MFISH_CZ_DEXTRAN_TIF (path to the registered dextran
+# channel, e.g. channel_1_ref_1/*.tif) — unset ⇒ density-onset (default). Dextran only applies
+# to pan-neuronal samples (pan-inhibitory stacks have no dextran channel). Constants + logic
+# validated in session 22/25 (the dextran run reproduced the density-onset coreg to 99.1%).
+DEX_GRID_MARGIN_PX = 60      # keep sample columns clear of FOV-edge / tile-seam artifacts
+DEX_GRID_N = 30              # 30x30 sampling grid across the FOV
+DEX_P99_PCTL = 99.0          # per-column AND global-profile "vessel present" percentile
+DEX_GATE_MARGIN_UM = 25.0    # drop columns whose leading-edge crossing is >25um deeper than the
+                             # per-column median (folds/debris, not the true plexus) before tilt fit
+DEX_PEAK_SEARCH_Z_PX = 120   # plexus peak must be shallow (first 120 z-slices)
+DEX_LEADING_EDGE_FRAC = 0.2  # global leading edge = first z where whole-FOV p99 reaches 20% of
+                             # (peak - deep-parenchyma baseline)
+DEX_BASELINE_Z_LO_UM = 150.0
+DEX_BASELINE_Z_HI_UM = 400.0  # deep parenchyma window for the baseline dextran level
+DEX_MIN_GRID_POINTS = 20      # below this the plane fit is not trustworthy -- fail loudly
+
+
+def compute_dextran_cz_pia_surface(s, dextran_tif_path: str,
+                                   l1_thickness_um: float) -> dict:
+    """Dextran-plexus leading-edge CZ pia surface, in the SAME canonical
+    ``{a,b,c,p,q,r}`` dict + coordinate convention as
+    ``compute_cz_pia_surface_panneuronal`` (so it plugs into
+    ``depth_from_surface`` / ``cz_binary_top_mip`` identically). x/y in CZ µm via
+    ``s.cz_xy_um``, z via ``s.cz_z_um``. ``l1_thickness_um`` is passed in (borrowed from
+    the density-onset surface), not recomputed — only pia/tilt vary vs the density-onset
+    pia. Raises (fail-loud) if the dextran TIF is unreadable or too few grid columns cross
+    the plexus threshold. Session 22/25; gated by ``MFISH_CZ_DEXTRAN_TIF``."""
+    xy_um = float(s.cz_xy_um)
+    z_um = float(s.cz_z_um)
+
+    # FOV-center anchor, from the SAME CZ centroids the density-onset surface uses.
+    cz_um = cz_px_to_um(s.cz_centroids[["z_px", "y_px", "x_px"]].to_numpy(float), s)
+    x_all, y_all = cz_um[:, 2], cz_um[:, 1]
+    xc, yc = float(x_all.max()) / 2.0, float(y_all.max()) / 2.0
+
+    dex = tifffile.imread(dextran_tif_path).astype(np.float32)  # (Z, Y, X)
+    Zn, Yn, Xn = dex.shape
+    print(f"[dextran-surface] loaded {dextran_tif_path} shape={dex.shape}", flush=True)
+    zz = np.arange(Zn) * z_um
+
+    def fit_plane_irls(P, n_iter=5):
+        X = np.c_[P[:, 0], P[:, 1], np.ones(len(P))]
+        yv = P[:, 2]
+        w = np.ones(len(P))
+        for _ in range(n_iter):
+            W = np.sqrt(w)[:, None]
+            cf = np.linalg.lstsq(X * W, yv * W[:, 0], rcond=None)[0]
+            r = yv - X @ cf
+            mad = np.median(np.abs(r)) + 1e-6
+            w = 1.0 / (1.0 + (r / (2.5 * mad)) ** 2)
+        return float(cf[0]), float(cf[1]), float(cf[2])
+
+    gyv = np.linspace(DEX_GRID_MARGIN_PX, Yn - DEX_GRID_MARGIN_PX, DEX_GRID_N).astype(int)
+    gxv = np.linspace(DEX_GRID_MARGIN_PX, Xn - DEX_GRID_MARGIN_PX, DEX_GRID_N).astype(int)
+    thr99 = float(np.percentile(dex, DEX_P99_PCTL))
+    P_list = []
+    for iy in gyv:
+        for ix in gxv:
+            col = gaussian_filter1d(dex[:, iy, ix], 2)
+            above = np.where(col > thr99)[0]
+            if above.size:
+                P_list.append((ix * xy_um, iy * xy_um, float(zz[above[0]])))
+    Pdex = np.asarray(P_list)
+    if len(Pdex) < DEX_MIN_GRID_POINTS:
+        raise RuntimeError(
+            f"dextran surface: only {len(Pdex)} of {DEX_GRID_N * DEX_GRID_N} grid columns "
+            f"crossed the p99 threshold -- too few for a robust plane fit")
+    a0, b0, c0_ungated = fit_plane_irls(Pdex)  # diagnostic only
+
+    med_z = float(np.median(Pdex[:, 2]))
+    gate = Pdex[:, 2] < med_z + DEX_GATE_MARGIN_UM
+    aD, bD, _ = fit_plane_irls(Pdex[gate])
+
+    dpx = np.percentile(dex.reshape(Zn, -1), DEX_P99_PCTL, axis=1)  # whole-FOV p99 per z
+    baseline_mask = (zz > DEX_BASELINE_Z_LO_UM) & (zz < DEX_BASELINE_Z_HI_UM)
+    if not baseline_mask.any():
+        raise RuntimeError("dextran surface: no z-slices in the deep-parenchyma baseline window "
+                           f"[{DEX_BASELINE_Z_LO_UM},{DEX_BASELINE_Z_HI_UM}]um -- stack too shallow")
+    dbase = float(np.median(dpx[baseline_mask]))
+    peak_window = min(DEX_PEAK_SEARCH_Z_PX, Zn)
+    pk_i = int(np.argmax(dpx[:peak_window]))
+    pk_z, pk_v = float(zz[pk_i]), float(dpx[:peak_window].max())
+    edge_thr = dbase + DEX_LEADING_EDGE_FRAC * (pk_v - dbase)
+    edge_candidates = np.where((zz <= pk_z) & (dpx >= edge_thr))[0]
+    if edge_candidates.size == 0:
+        raise RuntimeError("dextran surface: no leading-edge crossing found shallower than the "
+                           "plexus peak -- global profile too flat / threshold too high")
+    edge_z = float(zz[edge_candidates[0]])
+
+    # Anchor the gated tilt's intercept so the plane equals the global leading-edge depth AT the
+    # FOV center (spatially-resolved tilt + spatially-averaged, robust absolute depth reference).
+    c_edge = edge_z - (aD * xc + bD * yc)
+    pia_at_center = aD * xc + bD * yc + c_edge
+
+    surface = dict(
+        a=float(aD), b=float(bD), c=float(c_edge), p=0.0, q=0.0, r=0.0,
+        l1_thickness_um=float(l1_thickness_um),
+        method="panneuronal_dextran_plexus_leading_edge",
+        subject_id=str(s.subject_id),
+        n_grid_columns=int(len(Pdex)), n_grid_columns_gated=int(gate.sum()),
+        ungated_tilt_ab=[float(a0), float(b0)], ungated_intercept_um=float(c0_ungated),
+        plexus_peak_z_um=pk_z, plexus_peak_p99=pk_v, parenchyma_baseline_p99=dbase,
+        leading_edge_z_um=edge_z, pia_at_fov_center_um=float(pia_at_center),
+        fov_center_xy_um=[xc, yc], cz_xy_um=xy_um, cz_z_um=z_um,
+        dextran_tif=str(dextran_tif_path),
+    )
+    print(f"[dextran-surface] tilt=({aD:+.4f},{bD:+.4f}) pia@center={pia_at_center:.1f}um "
+          f"leading_edge={edge_z:.1f}um peak=({pk_z:.1f}um,{pk_v:.1f}) baseline={dbase:.1f} "
+          f"n_grid={len(Pdex)} n_gated={int(gate.sum())} l1_thickness_um={l1_thickness_um:.1f}",
+          flush=True)
+    return surface
+
+
 def get_cz_pia_surface_panneuronal(
     s, *, use_cache: bool = True, write_cache: bool = True,
 ) -> dict | None:
@@ -338,6 +456,25 @@ def get_cz_pia_surface_panneuronal(
     import cycle — ``surfaces.py`` imports helpers FROM this module.
     """
     from autocoreg import config as _config
+    # Dextran gate: MFISH_CZ_DEXTRAN_TIF (path to the registered dextran channel) ⇒ use the
+    # dextran-plexus pia instead of the density-onset one. Only pia/tilt differ; L1 thickness is
+    # borrowed from the density-onset surface. Distinct cache filename so it never clobbers the
+    # density-onset cache. Unset ⇒ density-onset (default, unchanged). Pan-neuronal only.
+    dextran_tif = os.environ.get("MFISH_CZ_DEXTRAN_TIF", "").strip()
+    if dextran_tif:
+        dex_cache = (
+            _config.SURFACES_CACHE_DIR / f"{s.subject_id}_cz_dextran_panneuronal.json"
+        )
+        if use_cache and dex_cache.exists():
+            return json.loads(dex_cache.read_text())
+        onset = compute_cz_pia_surface_panneuronal(s)   # for the L1 thickness only
+        if onset is None:
+            return None
+        surface = compute_dextran_cz_pia_surface(s, dextran_tif, onset["l1_thickness_um"])
+        if write_cache:
+            dex_cache.parent.mkdir(parents=True, exist_ok=True)
+            dex_cache.write_text(json.dumps(surface, indent=2))
+        return surface
     cache_path = (
         _config.SURFACES_CACHE_DIR / f"{s.subject_id}_cz_onset_panneuronal.json"
     )
