@@ -360,14 +360,12 @@ def compute_dextran_cz_pia_surface(s, dextran_tif_path: str,
     xy_um = float(s.cz_xy_um)
     z_um = float(s.cz_z_um)
 
-    # FOV-center anchor, from the SAME CZ centroids the density-onset surface uses.
-    cz_um = cz_px_to_um(s.cz_centroids[["z_px", "y_px", "x_px"]].to_numpy(float), s)
-    x_all, y_all = cz_um[:, 2], cz_um[:, 1]
-    xc, yc = float(x_all.max()) / 2.0, float(y_all.max()) / 2.0
-
+    # FOV-center anchor in the dextran/CZ pixel coordinate system.
+    # Use the registered dextran volume dimensions (not centroid extents) so the anchor is stable.
     dex = tifffile.imread(dextran_tif_path).astype(np.float32)  # (Z, Y, X)
     Zn, Yn, Xn = dex.shape
     print(f"[dextran-surface] loaded {dextran_tif_path} shape={dex.shape}", flush=True)
+    xc, yc = (Xn - 1) * xy_um / 2.0, (Yn - 1) * xy_um / 2.0
     zz = np.arange(Zn) * z_um
 
     def fit_plane_irls(P, n_iter=5):
