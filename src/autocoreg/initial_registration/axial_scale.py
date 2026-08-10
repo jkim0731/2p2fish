@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import glob
 import json
+import os
 import tempfile
 from pathlib import Path
 
@@ -162,14 +163,24 @@ def _warp_cz_into_hcr_crop(
 # ----------------------------------------------------------------------
 
 def _find_cz_seg_tiff(sid: str) -> str:
-    pat = (
-        f"/data/multiplane-ophys_{sid}_*-segmentation_*/"
-        "channel_0_ref_0/segmentation_masks.tif"
-    )
-    paths = sorted(glob.glob(pat))
-    if not paths:
-        raise FileNotFoundError(f"No CZ seg TIFF for {sid}: {pat}")
-    return paths[-1]
+    # Direct override: point at the exact segmentation_masks.tif (naming/structure-agnostic).
+    override = os.environ.get("MFISH_CZ_SEG_TIF", "").strip()
+    if override:
+        if not Path(override).exists():
+            raise FileNotFoundError(f"MFISH_CZ_SEG_TIF set but not found: {override}")
+        return override
+    # Else glob under DATA_ROOT (was hardcoded /data), first the channel_0_ref_0 layout then a
+    # structure-agnostic recursive fallback (e.g. ophys-z-stacks seg has the tif at the stack root).
+    root = os.environ.get("MFISH_DATA_ROOT", "/data")
+    for pat in (
+        f"{root}/multiplane-ophys_{sid}_*-segmentation_*/channel_0_ref_0/segmentation_masks.tif",
+        f"{root}/multiplane-ophys_{sid}_*-segmentation_*/**/segmentation_masks.tif",
+    ):
+        paths = sorted(glob.glob(pat, recursive=True))
+        if paths:
+            return paths[-1]
+    raise FileNotFoundError(
+        f"No CZ seg TIFF for {sid} under {root} (set MFISH_CZ_SEG_TIF to point at it directly)")
 
 
 def _load_cz_seg_binary(sid: str) -> np.ndarray:

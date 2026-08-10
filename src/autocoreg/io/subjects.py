@@ -145,17 +145,31 @@ def _synthesize_coreg_dir(subject_id: str) -> Path | None:
     empty downstream — they are validation-only). Returns the synthesized dir, or None if the
     registration/segmentation assets are missing.
     """
+    # Direct overrides (point at the exact CZ registered image / segmentation TIF) take
+    # precedence over globbing — naming/structure-agnostic (e.g. ophys-z-stacks stacks).
+    reg_override = os.environ.get("MFISH_CZ_REG_TIF", "").strip()
+    seg_override = os.environ.get("MFISH_CZ_SEG_TIF", "").strip()
     reg_dir = _find_czstack_reg_dir(subject_id)
     seg_dir = _find_czstack_seg_dir(subject_id)
-    if reg_dir is None or seg_dir is None:
+    if reg_override:
+        reg_tif = Path(reg_override)
+    elif reg_dir is not None:
+        reg_tifs = (sorted(reg_dir.rglob("*_2xREG.tif"))
+                    or sorted(reg_dir.rglob("cortical_zstack_*.tif")))
+        reg_tif = reg_tifs[0] if reg_tifs else None
+    else:
+        reg_tif = None
+    if seg_override:
+        seg_tif = Path(seg_override)
+    elif seg_dir is not None:
+        seg_tifs = sorted(seg_dir.rglob("segmentation_masks.tif"))
+        seg_tif = seg_tifs[0] if seg_tifs else None
+    else:
+        seg_tif = None
+    if reg_tif is None or seg_tif is None or not reg_tif.exists() or not seg_tif.exists():
         return None
-    reg_tifs = (sorted(reg_dir.rglob("*_2xREG.tif"))
-                or sorted(reg_dir.rglob("cortical_zstack_*.tif")))
-    seg_tifs = sorted(seg_dir.rglob("segmentation_masks.tif"))
-    if not reg_tifs or not seg_tifs:
-        return None
-    reg_tif, seg_tif = reg_tifs[0], seg_tifs[0]
-    name = "_".join(reg_dir.name.split("_")[1:3])              # {sid}_{session-date}
+    name = ("_".join(reg_dir.name.split("_")[1:3]) if reg_dir is not None
+            else f"{subject_id}_manual")              # {sid}_{session-date}
     out = Path(os.environ.get("MFISH_COREG_DIR",
                               str(_config.CACHE_DIR / "synthesized_coreg"))) / f"{name}_ctl-czstack-hcr-coreg_auto"
     out.mkdir(parents=True, exist_ok=True)
