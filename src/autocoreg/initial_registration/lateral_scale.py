@@ -186,11 +186,21 @@ SXY_GRID_SEARCH_OFFSETS = (-0.10, -0.05, -0.02, 0.02, 0.05, 0.10)
 # path discovery
 # -----------------------------------------------------------
 def _cz_seg_mask_path(sid: str) -> Path:
+    override = os.environ.get("MFISH_CZ_SEG_TIF", "").strip()
+    if override:
+        p = Path(override)
+        if not p.exists():
+            raise FileNotFoundError(f"MFISH_CZ_SEG_TIF set but not found: {override}")
+        return p
     for d in DATA_DIR.glob(f"multiplane-ophys_{sid}_*cortical-zstack-segmentation*"):
         tif = d / "channel_0_ref_0" / "segmentation_masks.tif"
         if tif.exists():
             return tif
-    raise FileNotFoundError(f"CZ segmentation_masks.tif for {sid}")
+        alt = sorted(d.rglob("segmentation_masks.tif"))   # structure-agnostic fallback
+        if alt:
+            return alt[-1]
+    raise FileNotFoundError(
+        f"CZ segmentation_masks.tif for {sid} (set MFISH_CZ_SEG_TIF to point at it directly)")
 
 
 def _hcr_metrics_path(sid: str) -> Path:

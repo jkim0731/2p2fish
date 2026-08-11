@@ -129,17 +129,25 @@ def final_round_csv(sid_out_dir) -> Path:
 
 
 def find_cz_seg_tiff(sid: str) -> Path:
-    """CZ segmentation_masks.tif (label volume, ZYX, int) under DATA_ROOT."""
+    """CZ segmentation_masks.tif (label volume, ZYX, int). MFISH_CZ_SEG_TIF pins it directly;
+    else glob under DATA_ROOT (channel_0_ref_0 layout, then a structure-agnostic recursive fallback)."""
+    override = os.environ.get("MFISH_CZ_SEG_TIF", "").strip()
+    if override:
+        if not Path(override).exists():
+            raise FileNotFoundError(f"MFISH_CZ_SEG_TIF set but not found: {override}")
+        return Path(override)
     root = str(_config.DATA_ROOT)
     pats = [
         f"{root}/multiplane-ophys_{sid}_*-segmentation_*/channel_0_ref_0/segmentation_masks.tif",
         f"{root}/multiplane-ophys_{sid}_*-seg_*/channel_0_ref_0/segmentation_masks.tif",
+        f"{root}/multiplane-ophys_{sid}_*-segmentation_*/**/segmentation_masks.tif",
     ]
     for pat in pats:
-        paths = sorted(glob.glob(pat))
+        paths = sorted(glob.glob(pat, recursive=True))
         if paths:
             return Path(paths[-1])
-    raise FileNotFoundError(f"No CZ seg TIFF for {sid} under {root}")
+    raise FileNotFoundError(
+        f"No CZ seg TIFF for {sid} under {root} (set MFISH_CZ_SEG_TIF to point at it directly)")
 
 
 def open_hcr_seg_zarr_array(s):
