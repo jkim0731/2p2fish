@@ -153,6 +153,8 @@ def _synthesize_coreg_dir(subject_id: str) -> Path | None:
     seg_dir = _find_czstack_seg_dir(subject_id)
     if reg_override:
         reg_tif = Path(reg_override)
+        if not reg_tif.exists():
+            raise FileNotFoundError(f"MFISH_CZ_REG_TIF set but not found: {reg_override}")
     elif reg_dir is not None:
         reg_tifs = (sorted(reg_dir.rglob("*_2xREG.tif"))
                     or sorted(reg_dir.rglob("cortical_zstack_*.tif")))
@@ -161,12 +163,14 @@ def _synthesize_coreg_dir(subject_id: str) -> Path | None:
         reg_tif = None
     if seg_override:
         seg_tif = Path(seg_override)
+        if not seg_tif.exists():
+            raise FileNotFoundError(f"MFISH_CZ_SEG_TIF set but not found: {seg_override}")
     elif seg_dir is not None:
         seg_tifs = sorted(seg_dir.rglob("segmentation_masks.tif"))
         seg_tif = seg_tifs[0] if seg_tifs else None
     else:
         seg_tif = None
-    if reg_tif is None or seg_tif is None or not reg_tif.exists() or not seg_tif.exists():
+    if reg_tif is None or seg_tif is None:
         return None
     name = ("_".join(reg_dir.name.split("_")[1:3]) if reg_dir is not None
             else f"{subject_id}_manual")              # {sid}_{session-date}
