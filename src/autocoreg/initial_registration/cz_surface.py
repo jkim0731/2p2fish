@@ -297,6 +297,24 @@ def compute_cz_pia_surface_panneuronal(s) -> dict | None:
     tissue_onset, l1l2_onset, sharpness, steepest_rise = (
         _panneuronal_l1l2_onset(z, y, x, tilt_a, tilt_b))
 
+    # User-provided acquisition pia estimate (depth µm below the first slice) OVERRIDES the
+    # superficial-peak detection below — that step is corrupted by junk ROIs above the pia, which
+    # look like real cells and can't be classified out. The tilt (a,b) + L1/L2 onset above are
+    # detected from the density and kept (junk-immune); this only pins the pia intercept. 0 is
+    # allowed (stack starts at the pia). Env: AUTOCOREG_CZ_PIA_UM (legacy alias MFISH_CZ_PIA_UM).
+    pia_in = os.environ.get("AUTOCOREG_CZ_PIA_UM", os.environ.get("MFISH_CZ_PIA_UM", "")).strip()
+    if pia_in != "":
+        pia = float(pia_in)
+        return dict(
+            a=float(tilt_a), b=float(tilt_b), c=float(pia), p=0.0, q=0.0, r=0.0,
+            l1_thickness_um=float(l1l2_onset - pia),
+            method="panneuronal_user_pia",
+            subject_id=str(s.subject_id), n_cz_cells=int(len(cz_um)),
+            tissue_onset_um=float(tissue_onset), l1l2_onset_um=float(l1l2_onset),
+            l1l2_steepest_rise_um=float(steepest_rise), l1l2_sharpness=float(sharpness),
+            superficial_peak_um=None, pia_source="acquisition_user_input",
+        )
+
     _, centers, density = _panneuronal_density_profile(
         z, y, x, tilt_a, tilt_b,
         PANNEURONAL_PEAK_BIN_UM, PANNEURONAL_PEAK_SIGMA_BINS)
