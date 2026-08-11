@@ -302,9 +302,22 @@ def compute_cz_pia_surface_panneuronal(s) -> dict | None:
     # look like real cells and can't be classified out. The tilt (a,b) + L1/L2 onset above are
     # detected from the density and kept (junk-immune); this only pins the pia intercept. 0 is
     # allowed (stack starts at the pia). Env: AUTOCOREG_CZ_PIA_UM (legacy alias MFISH_CZ_PIA_UM).
-    pia_in = os.environ.get("AUTOCOREG_CZ_PIA_UM", os.environ.get("MFISH_CZ_PIA_UM", "")).strip()
-    if pia_in != "":
-        pia = float(pia_in)
+    pia_autocoreg = os.environ.get("AUTOCOREG_CZ_PIA_UM", "").strip()
+    pia_legacy = os.environ.get("MFISH_CZ_PIA_UM", "").strip()
+    pia_in = pia_autocoreg or pia_legacy
+    if pia_in:
+        try:
+            pia = float(pia_in)
+        except ValueError as exc:
+            raise ValueError(
+                f"AUTOCOREG_CZ_PIA_UM/MFISH_CZ_PIA_UM must be a float (µm), got {pia_in!r}"
+            ) from exc
+        if pia < 0:
+            raise ValueError(f"AUTOCOREG_CZ_PIA_UM/MFISH_CZ_PIA_UM must be >= 0 µm, got {pia}")
+        if pia > l1l2_onset:
+            raise ValueError(
+                f"Provided pia ({pia} µm) is deeper than detected L1/L2 onset ({l1l2_onset} µm); would produce negative L1 thickness"
+            )
         return dict(
             a=float(tilt_a), b=float(tilt_b), c=float(pia), p=0.0, q=0.0, r=0.0,
             l1_thickness_um=float(l1l2_onset - pia),
