@@ -171,7 +171,7 @@ def _find_cz_seg_tiff(sid: str) -> str:
         return override
     # Else glob under DATA_ROOT (was hardcoded /data), first the channel_0_ref_0 layout then a
     # structure-agnostic recursive fallback (e.g. ophys-z-stacks seg has the tif at the stack root).
-    root = os.environ.get("MFISH_DATA_ROOT", "/data")
+    root = str(_config.DATA_ROOT)
     for pat in (
         f"{root}/multiplane-ophys_{sid}_*-segmentation_*/channel_0_ref_0/segmentation_masks.tif",
         f"{root}/multiplane-ophys_{sid}_*-segmentation_*/**/segmentation_masks.tif",
