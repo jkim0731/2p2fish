@@ -127,9 +127,14 @@ def _plan_warp_resources(n_anchors, slice_npix, shared_bytes, nz, requested_work
     each worker's share. Larger volume / more anchors / less RAM ⇒ fewer workers and/or smaller
     chunk, automatically. Env overrides: MFISH_QC_WARP_WORKERS, MFISH_QC_RBF_CHUNK, MFISH_QC_MEM_*."""
     avail = _available_memory_bytes()
-    safety = float(os.environ.get("MFISH_QC_MEM_SAFETY", "0.6"))
+    try:
+        safety = float(os.environ.get("MFISH_QC_MEM_SAFETY", "0.6"))
+    except (TypeError, ValueError, OverflowError):
+        safety = 0.6
+    safety = min(max(safety, 0.05), 0.95)
     reserve = int(shared_bytes) + 512 * 1024 * 1024          # shared CZ vols (once) + parent cushion
-    usable = max(int(avail * safety) - reserve, 256 * 1024 * 1024)
+    target = int(avail * safety) - reserve
+    usable = max(target, min(256 * 1024 * 1024, int(avail * safety)))
     kpq = max(1, int(n_anchors)) * 8 * 2                      # bytes/query in one eval (dist + kernel)
     FIXED = 160 * 1024 * 1024                                # per-worker interp + slice/coord buffers
     # Cap the chunk: past ~64k query points BLAS is already saturated, so a larger transient
