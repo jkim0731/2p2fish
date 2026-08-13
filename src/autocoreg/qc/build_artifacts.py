@@ -116,7 +116,7 @@ def _available_memory_bytes() -> int:
 
 
 def _plan_warp_resources(n_anchors, slice_npix, shared_bytes, nz, requested_workers=None):
-    """Pick (n_workers, rbf_chunk) so the parallel inverse-TPS warp fits in RAM at ANY z-stack /
+    """Pick (n_workers, rbf_chunk, avail_bytes, usable_bytes, peak_gb) so the parallel inverse-TPS warp fits in RAM at ANY z-stack /
     anchor-set size — no hard-coded 700 special case.
 
     The peak-memory driver is one Rbf eval's transient ``(chunk × n_anchors)`` distance+kernel
