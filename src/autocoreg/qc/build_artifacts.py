@@ -137,7 +137,13 @@ def _plan_warp_resources(n_anchors, slice_npix, shared_bytes, nz, requested_work
     MIN_CHUNK, MAX_CHUNK = 4096, min(65536, max(4096, int(slice_npix)))
     cpu = max(1, (os.cpu_count() or 2) - 2)
     env_w = os.environ.get("MFISH_QC_WARP_WORKERS", "").strip()
-    req = int(env_w) if env_w else (requested_workers or cpu)
+    if env_w:
+        try:
+            req = int(env_w)
+        except ValueError:
+            req = requested_workers or cpu
+    else:
+        req = requested_workers or cpu
     req = max(1, min(int(req), int(nz)))
     afford = max(1, int(usable // (FIXED + MIN_CHUNK * kpq)))  # most workers affording a min chunk
     n_workers = max(1, min(req, afford))
