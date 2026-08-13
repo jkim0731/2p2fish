@@ -69,6 +69,89 @@ def _rbf_eval_chunked(rbf_axis, Z, Y, X, chunk=250_000):
     return out
 
 
+def _available_memory_bytes() -> int:
+    """Best-effort available RAM in bytes, honouring a CONTAINER's cgroup limit (a capsule's
+    /proc/meminfo reports the whole HOST, which overshoots and is what OOM-killed the 700 warp).
+    Returns min(host MemAvailable, cgroup limit − current usage). ``MFISH_QC_MEM_BUDGET_GB``
+    overrides everything; conservative fallback if nothing is readable."""
+    ov = os.environ.get("MFISH_QC_MEM_BUDGET_GB", "").strip()
+    if ov:
+        try:
+            return max(1, int(float(ov) * (1024 ** 3)))
+        except ValueError:
+            pass
+    cands = []
+    try:                                            # host reclaimable-aware available
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    cands.append(int(line.split()[1]) * 1024)
+                    break
+    except OSError:
+        pass
+    for lim_p, use_p in (                           # cgroup ceiling INSIDE the container
+        ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),               # v2
+        ("/sys/fs/cgroup/memory/memory.limit_in_bytes",
+         "/sys/fs/cgroup/memory/memory.usage_in_bytes"),                              # v1
+    ):
+        try:
+            raw = open(lim_p).read().strip()
+            if raw and raw != "max":
+                lim = int(raw)
+                if 0 < lim < (1 << 62):
+                    try:
+                        used = int(open(use_p).read().strip())
+                    except OSError:
+                        used = 0
+                    cands.append(max(lim - used, 1))
+        except OSError:
+            pass
+    if cands:
+        return max(1, min(cands))
+    try:
+        return int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) // 2
+    except (ValueError, OSError):
+        return 8 * (1024 ** 3)
+
+
+def _plan_warp_resources(n_anchors, slice_npix, shared_bytes, nz, requested_workers=None):
+    """Pick (n_workers, rbf_chunk) so the parallel inverse-TPS warp fits in RAM at ANY z-stack /
+    anchor-set size — no hard-coded 700 special case.
+
+    The peak-memory driver is one Rbf eval's transient ``(chunk × n_anchors)`` distance+kernel
+    matrix, which scipy materialises twice; the fork-shared CZ volumes are counted ONCE (COW). So
+    total peak ≈ ``n_workers × (FIXED + chunk × n_anchors × 16 B)`` on top of the shared volumes.
+    We read the live (cgroup-aware) budget, subtract the shared volumes + a parent cushion, then
+    (a) take the most workers that still afford a minimal chunk each, and (b) grow the chunk to fill
+    each worker's share. Larger volume / more anchors / less RAM ⇒ fewer workers and/or smaller
+    chunk, automatically. Env overrides: MFISH_QC_WARP_WORKERS, MFISH_QC_RBF_CHUNK, MFISH_QC_MEM_*."""
+    avail = _available_memory_bytes()
+    safety = float(os.environ.get("MFISH_QC_MEM_SAFETY", "0.6"))
+    reserve = int(shared_bytes) + 512 * 1024 * 1024          # shared CZ vols (once) + parent cushion
+    usable = max(int(avail * safety) - reserve, 256 * 1024 * 1024)
+    kpq = max(1, int(n_anchors)) * 8 * 2                      # bytes/query in one eval (dist + kernel)
+    FIXED = 160 * 1024 * 1024                                # per-worker interp + slice/coord buffers
+    # Cap the chunk: past ~64k query points BLAS is already saturated, so a larger transient
+    # matrix buys no speed and only widens the blast radius of a memory-estimate miss.
+    MIN_CHUNK, MAX_CHUNK = 4096, min(65536, max(4096, int(slice_npix)))
+    cpu = max(1, (os.cpu_count() or 2) - 2)
+    env_w = os.environ.get("MFISH_QC_WARP_WORKERS", "").strip()
+    req = int(env_w) if env_w else (requested_workers or cpu)
+    req = max(1, min(int(req), int(nz)))
+    afford = max(1, int(usable // (FIXED + MIN_CHUNK * kpq)))  # most workers affording a min chunk
+    n_workers = max(1, min(req, afford))
+    chunk = int((usable // n_workers - FIXED) // kpq)          # grow chunk to each worker's share
+    chunk = max(MIN_CHUNK, min(chunk, MAX_CHUNK))
+    env_c = os.environ.get("MFISH_QC_RBF_CHUNK", "").strip()
+    if env_c:
+        try:
+            chunk = max(1, int(env_c))
+        except ValueError:
+            pass
+    peak_gb = n_workers * (FIXED + chunk * kpq) / (1024 ** 3)
+    return n_workers, chunk, avail, usable, peak_gb
+
+
 def _warp_zslice_chunk(k_range):
     """Warp a contiguous block of output z-slices (CZ seg order-0 + CZ image
     order-1) using the fork-inherited ``_WARP_CTX``.  Returns (k0, cz_block,
@@ -80,6 +163,7 @@ def _warp_zslice_chunk(k_range):
     cz_seg, cz_vol, ny, nx = c["cz_seg"], c["cz_vol"], c["ny"], c["nx"]
     inv_affine = c.get("inv_affine"); inv_hull = c.get("inv_hull")
     tau = c.get("tau", 40.0); margin = c.get("margin", 0.0)
+    rbf_chunk = int(c.get("rbf_chunk", 250_000))   # memory-planned query-chunk (see _plan_warp_resources)
     ks = list(k_range)
     cz_block = np.zeros((len(ks), ny, nx), dtype=np.int32)
     img_block = np.zeros((len(ks), ny, nx), dtype=np.float32)
@@ -87,9 +171,9 @@ def _warp_zslice_chunk(k_range):
         z = z_lo + (k + 0.5) * vox
         Z_flat = np.full_like(Y_flat, z)
         # thin-plate prediction (CZ µm)
-        cz_z_um_p = _rbf_eval_chunked(rbf[0], Z_flat, Y_flat, X_flat)
-        cz_y_um_p = _rbf_eval_chunked(rbf[1], Z_flat, Y_flat, X_flat)
-        cz_x_um_p = _rbf_eval_chunked(rbf[2], Z_flat, Y_flat, X_flat)
+        cz_z_um_p = _rbf_eval_chunked(rbf[0], Z_flat, Y_flat, X_flat, chunk=rbf_chunk)
+        cz_y_um_p = _rbf_eval_chunked(rbf[1], Z_flat, Y_flat, X_flat, chunk=rbf_chunk)
+        cz_x_um_p = _rbf_eval_chunked(rbf[2], Z_flat, Y_flat, X_flat, chunk=rbf_chunk)
         if inv_affine is not None and inv_hull is not None:
             # blend to bounded affine OUTSIDE the HCR-anchor hull (w=1 inside).
             P = np.column_stack([Z_flat, Y_flat, X_flat, np.ones_like(Z_flat)])
@@ -323,15 +407,21 @@ def build_qc_artifacts(
     Y_flat, X_flat = Y.ravel(), X.ravel()
     t = time.time()
     from autocoreg.finetune_soma_print.tps import TPS_EXTRAP_TAU_UM, TPS_EXTRAP_MARGIN_UM
+    # Memory-adaptive parallelism: size worker count + per-eval Rbf chunk to the live,
+    # cgroup-aware RAM budget so the warp scales to ANY z-stack size without OOM. (The 700×700
+    # run was SIGKILLed here: a fixed 250k chunk × 3000 anchors × 14 workers ≈ 84 GB.)
+    shared_bytes = int(getattr(cz_seg, "nbytes", 0)) + int(getattr(cz_vol, "nbytes", 0))
+    n_workers, rbf_chunk, _avail, _usable, _peak = _plan_warp_resources(
+        n_anchors, ny * nx, shared_bytes, nz)
     _WARP_CTX.update(dict(
         rbf=rbf, Y_flat=Y_flat, X_flat=X_flat, z_lo=z_lo, vox=vox,
         cz_z_um=cz_z_um, cz_xy_um=cz_xy_um, cz_seg=cz_seg, cz_vol=cz_vol,
-        ny=ny, nx=nx,
+        ny=ny, nx=nx, rbf_chunk=rbf_chunk,
         inv_affine=inv_affine, inv_hull=inv_hull,
         tau=TPS_EXTRAP_TAU_UM, margin=TPS_EXTRAP_MARGIN_UM))
-    n_workers = int(os.environ.get(
-        "MFISH_QC_WARP_WORKERS", max(1, (os.cpu_count() or 2) - 2)))
-    n_workers = max(1, min(n_workers, nz))
+    print(f"[build_qc]   warp mem plan: avail={_avail/2**30:.1f}GB usable={_usable/2**30:.1f}GB "
+          f"shared(CZ vols)={shared_bytes/2**30:.2f}GB -> {n_workers} workers × "
+          f"rbf_chunk={rbf_chunk} (~{_peak:.1f}GB peak, {n_anchors} anchors)", flush=True)
     if n_workers == 1:
         k0, cz_b, img_b = _warp_zslice_chunk(range(nz))
         warped_cz[:] = cz_b
