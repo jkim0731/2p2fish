@@ -95,7 +95,8 @@ def _available_memory_bytes() -> int:
          "/sys/fs/cgroup/memory/memory.usage_in_bytes"),                              # v1
     ):
         try:
-            raw = open(lim_p).read().strip()
+            with open(lim_p) as f:
+                raw = f.read().strip()
             if raw and raw != "max":
                 lim = int(raw)
                 if 0 < lim < (1 << 62):
