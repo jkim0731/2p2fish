@@ -38,7 +38,7 @@ def _load_gmm_threshold(sid: str) -> dict:
     return next(r for r in data if r["subject"] == sid)
 
 
-def strict_gfp_ids(sid: str) -> tuple[set[int], dict]:
+def strict_gfp_ids(sid: str, force_gmm: bool = False) -> tuple[set[int], dict]:
     """Strict-GFP+ HCR ids using the 07b GMM-intersection cutoff.
 
     Benchmark subjects use the cached threshold JSON.  Any subject not in the
@@ -46,11 +46,14 @@ def strict_gfp_ids(sid: str) -> tuple[set[int], dict]:
     computed live via ``gfp_threshold.analyze_subject`` — the same seeded GMM —
     so the automated path needs no pre-cached threshold.
 
-    ``AUTOCOREG_GFP_FILTER=none`` disables GFP+ gating entirely: every HCR cell
-    passes, so the matchable pool = classifier-ok only (used to A/B the GFP cut
-    against no filtering, esp. for pan-neuronal where ~all cells express).
+    ``AUTOCOREG_GFP_FILTER=none`` disables GFP+ gating for the MATCHABLE POOL: every
+    HCR cell passes, so the pool = classifier-ok only (pan-neuronal default; ~all
+    cells express). ``force_gmm=True`` ignores that env and always computes the GMM
+    cutoff — used by the pan-neuronal surface L1/L2 detector, which needs the GFP+
+    population + a numeric cutoff to find the tissue boundary REGARDLESS of how the
+    matching pool is gated (the two uses are independent).
     """
-    if os.environ.get("AUTOCOREG_GFP_FILTER", "gmm").strip().lower() == "none":
+    if not force_gmm and os.environ.get("AUTOCOREG_GFP_FILTER", "gmm").strip().lower() == "none":
         s = load_subject(sid)
         _, hcr_all_ids = centroids_um(s, "hcr_all")
         ids = set(int(x) for x in hcr_all_ids)

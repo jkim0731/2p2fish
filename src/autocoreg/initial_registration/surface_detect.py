@@ -318,7 +318,10 @@ def compute_hcr_gfp_l1_thickness_panneuronal(
         return None
 
     hcr_zyx_um, hcr_ids = centroids_um(s, "hcr_all")
-    gfp_ids, gfp_meta = strict_gfp_ids(s.subject_id)
+    # Always the GMM GFP+ population here — the L1/L2 tissue boundary is defined by
+    # GFP+ cell density and is independent of whether the MATCHING pool is GFP-filtered
+    # (AUTOCOREG_GFP_FILTER=none must not turn this into an all-cells / cutoff=None path).
+    gfp_ids, gfp_meta = strict_gfp_ids(s.subject_id, force_gmm=True)
     gfp_id_arr = np.fromiter(gfp_ids, dtype=np.int64, count=len(gfp_ids))
     keep = np.isin(hcr_ids, gfp_id_arr)
     if int(keep.sum()) < HCR_L1L2_MIN_GFP_CELLS:
@@ -334,7 +337,7 @@ def compute_hcr_gfp_l1_thickness_panneuronal(
         l1_thickness_um=onset["onset_um"],
         steepest_rise_um=onset["steepest_rise_um"],
         n_gfp=onset["n_cells"],
-        gfp_cutoff_linear=float(gfp_meta.get("cutoff_linear", float("nan"))),
+        gfp_cutoff_linear=float(gfp_meta.get("cutoff_linear") or float("nan")),
     )
 
 
