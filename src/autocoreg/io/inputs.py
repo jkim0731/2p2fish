@@ -13,6 +13,7 @@ Provides:
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -44,7 +45,17 @@ def strict_gfp_ids(sid: str) -> tuple[set[int], dict]:
     cache (new / pipeline-monitor data, or a missing JSON) gets the cutoff
     computed live via ``gfp_threshold.analyze_subject`` — the same seeded GMM —
     so the automated path needs no pre-cached threshold.
+
+    ``AUTOCOREG_GFP_FILTER=none`` disables GFP+ gating entirely: every HCR cell
+    passes, so the matchable pool = classifier-ok only (used to A/B the GFP cut
+    against no filtering, esp. for pan-neuronal where ~all cells express).
     """
+    if os.environ.get("AUTOCOREG_GFP_FILTER", "gmm").strip().lower() == "none":
+        s = load_subject(sid)
+        _, hcr_all_ids = centroids_um(s, "hcr_all")
+        ids = set(int(x) for x in hcr_all_ids)
+        return ids, dict(cutoff_linear=None, feature="none", n_strict=len(ids),
+                         gfp_filter="none")
     try:
         rec = _load_gmm_threshold(sid)
     except (FileNotFoundError, StopIteration, json.JSONDecodeError):
