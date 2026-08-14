@@ -22,6 +22,7 @@ Public API (matches the original):
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -157,10 +158,21 @@ def gaussian_intersection(
 
 
 def fit_gmm_intersection(
-    log_values: np.ndarray, n_components: int, random_state: int = 0
+    log_values: np.ndarray, n_components: int, random_state: int = 0,
+    pair: str = "top",
 ) -> dict:
-    """Fit a K-component GMM on log-values and return intersection between
-    the rightmost (K−1) and second-rightmost (K−2) components."""
+    """Fit a K-component GMM on log-values and return the intersection cutoff.
+
+    ``pair`` selects WHICH adjacent component boundary is the GFP+ cutoff:
+      * ``"top"``  (default): intersection of the two RIGHTMOST components (K−1, K−2)
+        — separates the brightest GFP+ population from the rest. Sparse subjects
+        (pan-inhibitory / GT) where only a minority express.
+      * ``"bottom"``: intersection of the two LEFTMOST components (0, 1) — separates
+        the dim background/junk from everything above it. Pan-neuronal, where ~all
+        cells express and the GFP+ signal is the BULK, so cutting at the top would
+        slice through the real population; the meaningful boundary is background↔tissue.
+    In both cases the pair is ordered low→high mean before solving, so the returned
+    intersection lies between them."""
     X = np.asarray(log_values, dtype=float).reshape(-1, 1)
     gmm = GaussianMixture(
         n_components=n_components, n_init=5, random_state=random_state
@@ -169,9 +181,9 @@ def fit_gmm_intersection(
     mus = gmm.means_.ravel()[order]
     sigmas = np.sqrt(gmm.covariances_.ravel()[order])
     weights = gmm.weights_[order]
-    # Rightmost (index K-1) and second-rightmost (K-2)
-    mu1, s1, w1 = mus[-2], sigmas[-2], weights[-2]
-    mu2, s2, w2 = mus[-1], sigmas[-1], weights[-1]
+    lo, hi = (0, 1) if pair == "bottom" else (-2, -1)   # low-mean, high-mean of the chosen pair
+    mu1, s1, w1 = mus[lo], sigmas[lo], weights[lo]
+    mu2, s2, w2 = mus[hi], sigmas[hi], weights[hi]
     x_int, no_interior = gaussian_intersection(mu1, s1, w1, mu2, s2, w2)
     return {
         "means": mus.tolist(),
@@ -179,8 +191,9 @@ def fit_gmm_intersection(
         "weights": weights.tolist(),
         "intersection_log": float(x_int),
         "no_interior_root": bool(no_interior),
-        "sigma_right": float(sigmas[-1]),
-        "sigma_next": float(sigmas[-2]),
+        "pair": pair,
+        "sigma_right": float(sigmas[hi]),
+        "sigma_next": float(sigmas[lo]),
         "bic": float(gmm.bic(X)),
         "aic": float(gmm.aic(X)),
         "n_components": int(n_components),
@@ -192,6 +205,7 @@ def fit_gmm_sweep(
     k_min: int = 2,
     k_max: int = 6,
     random_state: int = 0,
+    pair: str = "top",
 ) -> dict:
     """Sweep ``n_components`` over ``[k_min, k_max]`` and pick the best K by BIC.
 
@@ -207,7 +221,7 @@ def fit_gmm_sweep(
     sweep = []
     for k in range(k_min, k_max + 1):
         try:
-            fit = fit_gmm_intersection(X, n_components=k, random_state=random_state)
+            fit = fit_gmm_intersection(X, n_components=k, random_state=random_state, pair=pair)
             sweep.append(fit)
         except Exception as e:
             sweep.append({"n_components": k, "error": f"{type(e).__name__}: {e}"})
@@ -277,7 +291,7 @@ def _load_intensity_feature(sid: str) -> pd.DataFrame:
 # ----------------------------------------------------------------------
 def _plot_subject(
     sid: str, feat_values: np.ndarray, fit: dict, cutoff_linear: float,
-    v22_cutoff_linear: float, feature_name: str, log_base: str,
+    feature_name: str, log_base: str,
     out_path: Path, sweep_entries: list | None = None,
 ):
     # Lazy matplotlib import so that analyze_subject / strict_gfp_df do not
@@ -296,6 +310,11 @@ def _plot_subject(
     sigmas = fit["sigmas"]
     weights = fit["weights"]
     x_int = fit["intersection_log"]
+    pair = fit.get("pair", "top")
+    n_all = int(feat_values.size)
+    n_kept = int((feat_values >= cutoff_linear).sum())
+    kept_pct = 100.0 * n_kept / max(n_all, 1)
+    cut_lbl = f"GFP+ cutoff [{pair}-2]"
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 4.4))
     # linear density panel (log-x)
@@ -310,18 +329,14 @@ def _plot_subject(
         ax.plot(xs, comp, lw=1.0, alpha=0.8)
         total = total + comp
     ax.plot(xs, total, lw=1.5, color="black", label="GMM total")
-    ax.axvline(x_int, color="#cc3333", lw=2.0, label=f"strict cutoff ({base_str}): {x_int:.3f}")
-    if np.isfinite(v22_cutoff_linear) and v22_cutoff_linear > 0:
-        v22_log = logfn(v22_cutoff_linear)
-        ax.axvline(v22_log, color="#3b7dd8", lw=1.2, ls="--",
-                   label=f"v2.2 cutoff ({base_str}): {v22_log:.3f}")
+    ax.axvline(x_int, color="#cc3333", lw=2.0, label=f"{cut_lbl} ({base_str}): {x_int:.3f}")
     ax.set_xlabel(f"{base_str}({feature_name})")
     ax.set_ylabel("density")
-    ax.set_title(f"{sid} — {feature_name} histogram + GMM-{len(mus)} + intersection")
+    ax.set_title(f"{sid} — {feature_name} histogram + GMM-{len(mus)} + {pair}-2 intersection")
     ax.legend(loc="upper right", fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    # Right panel: linear-axis histogram zoomed around the two top components
+    # Right panel: linear-axis histogram + the linear cutoff
     ax = axes[1]
     if is_log10:
         edges = 10 ** np.linspace(log_x.min() - 0.1, log_x.max() + 0.1, 100)
@@ -329,10 +344,7 @@ def _plot_subject(
         edges = np.exp(np.linspace(log_x.min() - 0.1, log_x.max() + 0.1, 100))
     ax.hist(pos, bins=edges, color="#94a3b8", alpha=0.6, label="all cells")
     ax.axvline(cutoff_linear, color="#cc3333", lw=2.0,
-               label=f"strict cutoff: {cutoff_linear:.3g}")
-    if np.isfinite(v22_cutoff_linear) and v22_cutoff_linear > 0:
-        ax.axvline(v22_cutoff_linear, color="#3b7dd8", lw=1.2, ls="--",
-                   label=f"v2.2 cutoff: {v22_cutoff_linear:.3g}")
+               label=f"{cut_lbl}: {cutoff_linear:.3g}\nkeeps {n_kept}/{n_all} = {kept_pct:.1f}%")
     ax.set_xscale("log")
     ax.set_xlabel(f"{feature_name} (linear, log-axis)")
     ax.set_ylabel("count")
@@ -383,12 +395,24 @@ def analyze_subject(sid: str) -> GmmIntersection:
     v22_df = s.hcr_gfp_df
     n_v22 = int(len(v22_df))
 
+    # Which component boundary is the GFP+ cutoff. Pan-neuronal expresses GCaMP in ~all
+    # neurons, so the GFP+ signal is the BULK and the meaningful cut is background↔tissue
+    # (intersection of the two LEFTMOST components); sparse subjects cut at the top instead.
+    # Env override AUTOCOREG_GFP_GMM_PAIR wins ("top"|"bottom").
+    from autocoreg.config import is_panneuronal
+    gmm_pair = os.environ.get(
+        "AUTOCOREG_GFP_GMM_PAIR",
+        "bottom" if is_panneuronal(sid) else "top",
+    ).strip().lower()
+    if gmm_pair not in ("top", "bottom"):
+        gmm_pair = "top"
+
     gfp_class = detect_gfp_class(sid)
     if gfp_class == "spot":
         df_feat = _load_spot_feature(sid)
         feat_values = df_feat["density"].values.astype(float)
         log_x = np.log(feat_values[feat_values > 0])
-        sweep = fit_gmm_sweep(log_x, k_min=2, k_max=6)
+        sweep = fit_gmm_sweep(log_x, k_min=2, k_max=6, pair=gmm_pair)
         fit = sweep["best"]
         cutoff = float(np.exp(fit["intersection_log"]))
         if "density" in v22_df.columns and n_v22:
@@ -401,7 +425,7 @@ def analyze_subject(sid: str) -> GmmIntersection:
         df_feat = _load_intensity_feature(sid)
         feat_values = df_feat["mean_minus_bg"].values.astype(float)
         log_x = np.log10(feat_values[feat_values > 0])
-        sweep = fit_gmm_sweep(log_x, k_min=2, k_max=6)
+        sweep = fit_gmm_sweep(log_x, k_min=2, k_max=6, pair=gmm_pair)
         fit = sweep["best"]
         cutoff = float(10.0 ** fit["intersection_log"])
         if "mean_minus_bg" in v22_df.columns and n_v22:
@@ -425,9 +449,12 @@ def analyze_subject(sid: str) -> GmmIntersection:
 
     # Sanity
     notes = []
-    mu_right = fit["means"][-1]
-    mu_next = fit["means"][-2]
-    interior_ok = (mu_next < fit["intersection_log"] < mu_right)
+    # Bracket the intersection by the SELECTED component pair (top-2 or bottom-2).
+    if fit.get("pair", "top") == "bottom":
+        mu_lo, mu_hi = fit["means"][0], fit["means"][1]
+    else:
+        mu_lo, mu_hi = fit["means"][-2], fit["means"][-1]
+    interior_ok = (mu_lo < fit["intersection_log"] < mu_hi)
     if not interior_ok or fit["no_interior_root"]:
         notes.append("intersection outside top-two mean bracket")
     if n_strict < 300:
@@ -442,7 +469,7 @@ def analyze_subject(sid: str) -> GmmIntersection:
         FIG_DIR.mkdir(parents=True, exist_ok=True)
         out_png = FIG_DIR / f"gmm_threshold_{sid}.png"
         _plot_subject(
-            sid, feat_values, fit, cutoff, v22_cut, feature_name, log_base, out_png,
+            sid, feat_values, fit, cutoff, feature_name, log_base, out_png,
             sweep_entries=sweep["sweep"],
         )
     except Exception:
