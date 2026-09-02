@@ -138,7 +138,10 @@ def estimate_sz_ols_from_pairs(
     if hcr_surf is None:
         hcr_surf = get_hcr_top_surface_iter07(s)
 
-    df = pd.read_csv(matches_csv)
+    try:
+        df = pd.read_csv(matches_csv, usecols=["cz_id", "hcr_id"]).dropna()
+    except ValueError as exc:
+        raise ValueError(f"{matches_csv}: expected columns 'cz_id' and 'hcr_id'") from exc
     if df.empty:
         return dict(sz_ols=float("nan"), n_pairs=0, n_used=0,
                     median_ratio=float("nan"), iqr_ratio=float("nan"),
