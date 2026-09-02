@@ -75,9 +75,13 @@ def estimate_sz_l1_ratio(s) -> dict:
     hcr_l1_result = compute_hcr_gfp_l1_thickness_panneuronal(s, hcr_top_surface=hcr_top)
     if hcr_l1_result is None:
         raise ValueError("HCR L1 thickness returned None — too few GFP+ cells?")
-    hcr_l1 = float(hcr_l1_result["l1_thickness_um"])
+    hcr_l1 = float(hcr_l1_result.get("l1_thickness_um", float("nan")))
+    if not np.isfinite(hcr_l1) or hcr_l1 <= 0:
+        raise ValueError(f"HCR L1 thickness invalid ({hcr_l1}); cannot compute sz seed")
 
     ratio = hcr_l1 / cz_l1
+    if not np.isfinite(ratio) or ratio <= 0:
+        raise ValueError(f"sz_seed (L1 ratio) invalid ({ratio}); cannot proceed")
     return dict(
         cz_l1_um      = cz_l1,
         hcr_l1_um     = hcr_l1,
