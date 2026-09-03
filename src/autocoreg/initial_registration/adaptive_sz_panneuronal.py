@@ -155,24 +155,22 @@ def estimate_sz_ols_from_pairs(
     cz_depths: list[float] = []
     hcr_depths: list[float] = []
 
-    for row in df.itertuples(index=False):
-        ci = cz_id_map.get(int(row.cz_id))
-        hi = hcr_id_map.get(int(row.hcr_id))
+    # Precompute depths once (depth_from_surface is vectorized)
+    cz_depth_all = depth_from_surface(cz_zyx_um[:, [2, 1, 0]], cz_surf).astype(float)
+    hcr_depth_all = depth_from_surface(hcr_zyx_um[:, [2, 1, 0]], hcr_surf).astype(float)
+
+    for cz_id, hcr_id in zip(df["cz_id"].astype(int), df["hcr_id"].astype(int)):
+        ci = cz_id_map.get(int(cz_id))
+        hi = hcr_id_map.get(int(hcr_id))
         if ci is None or hi is None:
             continue
 
-        cz_zyx  = cz_zyx_um[ci]
-        cz_xyz  = cz_zyx[[2, 1, 0]]           # (x, y, z) for depth_from_surface
-        cz_d    = float(depth_from_surface(cz_xyz[None, :], cz_surf)[0])
-
-        hcr_zyx = hcr_zyx_um[hi]
-        hcr_xyz = hcr_zyx[[2, 1, 0]]
-        hcr_d   = float(depth_from_surface(hcr_xyz[None, :], hcr_surf)[0])
+        cz_d = float(cz_depth_all[ci])
+        hcr_d = float(hcr_depth_all[hi])
 
         if cz_d >= min_cz_depth and hcr_d > 0:
             cz_depths.append(cz_d)
             hcr_depths.append(hcr_d)
-
     n_used  = len(cz_depths)
     n_total = len(df)
     if n_used < 10:
