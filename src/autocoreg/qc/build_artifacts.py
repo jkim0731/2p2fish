@@ -38,8 +38,10 @@ from autocoreg.io.cz_volume import load_cz_volume
 from autocoreg.io.inputs import load_sz_pins, subject_inputs
 
 # Default output voxel size (µm) for the warped CZ image + CZ/HCR seg overlays.
-# 2.0 µm gives crisp ROI boundaries + CZ image (4.0 was blocky); env-overridable.
-DEFAULT_VOXEL_UM = float(os.environ.get("MFISH_QC_VOXEL_UM", "2.0"))
+# 4.0 µm is 8× fewer voxels than 2.0 (faster warp), visually equivalent for QC
+# purposes (ROI dots ≥2px, image texture sufficient for alignment checks).
+# Override via MFISH_QC_VOXEL_UM env var if higher resolution is needed.
+DEFAULT_VOXEL_UM = float(os.environ.get("MFISH_QC_VOXEL_UM", "4.0"))
 
 # Cap on the number of TPS anchors used for the inverse warp. scipy.Rbf is O(N^3) to fit and
 # materializes an (N_query x N_anchor) kernel matrix per evaluation, so dense subjects (~8k
